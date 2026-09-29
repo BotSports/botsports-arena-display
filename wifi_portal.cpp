@@ -216,6 +216,9 @@ void WiFiPortal::_handleScan() {
 }
 
 void WiFiPortal::_handleSave() {
+    String oldSSID = configMgr.settings.wifi_ssid;
+    String oldPass = configMgr.settings.wifi_pass;
+
     if (!_server.hasArg("plain")) {
         configMgr.settings.wifi_ssid = _server.arg("ssid");
         configMgr.settings.wifi_pass = _server.arg("pass");
@@ -245,7 +248,7 @@ void WiFiPortal::_handleSave() {
         }
         if (doc["api_key"].is<const char*>()) {
             String k = doc["api_key"].as<String>();
-            if (k.length() > 0) configMgr.settings.api_key = k;
+            configMgr.settings.api_key = k;
         }
         if (doc["api_url"].is<const char*>()) configMgr.settings.api_url = doc["api_url"].as<String>();
         if (doc["corner"].is<const char*>()) configMgr.settings.corner = doc["corner"].as<String>();
@@ -270,14 +273,47 @@ void WiFiPortal::_handleSave() {
     }
 
     displayMgr.setBrightness(configMgr.settings.brightness);
-    bool saved = configMgr.saveSettings();
 
-    if (saved) {
-        _server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Saved! Device will reboot in 2 seconds.\"}");
+    // Validate API key if configured
+    bool keyValid = false;
+    String validationNote = "";
+    if (configMgr.settings.api_key.length() > 0) {
+        if (isConnected()) {
+            String err;
+            keyValid = apiClient.validateApiKey(configMgr.settings.api_key, configMgr.settings.api_url, err);
+            if (keyValid) {
+                validationNote = "Key verified for " + apiClient.getData().arena_name + "!";
+            } else {
+                validationNote = "Warning: Key validation failed (" + err + ").";
+                if (matchCtrl.getMode() == OPMODE_API) {
+                    matchCtrl.setMode(OPMODE_STANDALONE);
+                    configMgr.settings.op_mode = (uint8_t)OPMODE_STANDALONE;
+                }
+            }
+        } else {
+            validationNote = "Key saved. Will verify once connected to Wi-Fi.";
+        }
+    } else {
+        apiClient.setKeyValid(false);
+        if (matchCtrl.getMode() == OPMODE_API) {
+            matchCtrl.setMode(OPMODE_STANDALONE);
+            configMgr.settings.op_mode = (uint8_t)OPMODE_STANDALONE;
+        }
+    }
+
+    bool saved = configMgr.saveSettings();
+    if (!saved) {
+        _server.send(500, "application/json", "{\"status\":\"error\",\"message\":\"Failed to save settings to flash memory.\"}");
+        return;
+    }
+
+    bool wifiChanged = (configMgr.settings.wifi_ssid != oldSSID || configMgr.settings.wifi_pass != oldPass);
+    if (wifiChanged && configMgr.settings.wifi_ssid.length() > 0) {
+        _server.send(200, "application/json", "{\"status\":\"ok\",\"key_valid\":" + String(keyValid ? "true" : "false") + ",\"message\":\"Wi-Fi changed. Rebooting in 2s...\"}");
         _shouldReboot = true;
         _rebootTime = millis() + 2000;
     } else {
-        _server.send(500, "application/json", "{\"status\":\"error\",\"message\":\"Failed to save settings to flash memory.\"}");
+        _server.send(200, "application/json", "{\"status\":\"ok\",\"key_valid\":" + String(keyValid ? "true" : "false") + ",\"message\":\"Settings saved! " + validationNote + "\"}");
     }
 }
 
@@ -297,7 +333,11 @@ void WiFiPortal::_handleStatus() {
     doc["wifi_connected"] = isConnected();
     doc["configured_ssid"] = configMgr.settings.wifi_ssid;
     doc["api_url"] = configMgr.settings.api_url;
+    doc["api_key"] = configMgr.settings.api_key;
     doc["has_api_key"] = (configMgr.settings.api_key.length() > 0);
+    doc["api_key_valid"] = apiClient.isKeyValid();
+    doc["stream_connected"] = apiClient.isStreamConnected();
+    doc["key_validation_error"] = apiClient.getKeyValidationError();
     doc["corner"] = configMgr.settings.corner;
     doc["brightness"] = configMgr.settings.brightness;
     doc["mode"] = matchCtrl.getModeString();
@@ -337,6 +377,10 @@ void WiFiPortal::_handleControlStatus() {
     doc["active_test"] = matchCtrl.getActiveTestName();
     doc["brightness"] = configMgr.settings.brightness;
     doc["has_api_match"] = apiClient.getData().has_current_match;
+    doc["api_key_valid"] = apiClient.isKeyValid();
+    doc["stream_connected"] = apiClient.isStreamConnected();
+    doc["key_validation_error"] = apiClient.getKeyValidationError();
+    doc["clock_pause_reason"] = apiClient.getData().clock_pause_reason;
 
     doc["sync_role"] = configMgr.settings.sync_role;
     doc["sync_key"] = configMgr.settings.sync_key;
@@ -405,12 +449,29 @@ void WiFiPortal::_handleControlMode() {
     String mode = doc["mode"] | "";
     if (mode.equalsIgnoreCase("standalone")) {
         matchCtrl.setMode(OPMODE_STANDALONE);
+        apiClient.disconnectStream();
+        arenaSync.broadcastState(true);
+        _handleControlStatus();
     } else if (mode.equalsIgnoreCase("api")) {
-        matchCtrl.setMode(OPMODE_API);
+        if (!apiClient.isKeyValid()) {
+            String err;
+            if (configMgr.settings.api_key.length() > 0 && isConnected()) {
+                if (!apiClient.validateApiKey(configMgr.settings.api_key, configMgr.settings.api_url, err)) {
+                    _server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Cannot switch to BotSports Sync: " + err + "\"}");
+                    return;
+                }
+            } else {
+                _server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Cannot switch to BotSports Sync: No valid Arena API Key configured\"}");
+                return;
+            }
+        }
+        if (!matchCtrl.setMode(OPMODE_API)) {
+            _server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Cannot switch to BotSports Sync: Invalid API Key\"}");
+            return;
+        }
+        arenaSync.broadcastState(true);
+        _handleControlStatus();
     }
-
-    arenaSync.broadcastState(true);
-    _handleControlStatus();
 }
 
 void WiFiPortal::_handleControlTest() {
@@ -567,6 +628,10 @@ String WiFiPortal::_getHTMLPage() {
       <button type="button" class="mode-btn" id="mode_btn_api" onclick="setMode('api')">BotSports API Sync</button>
       <button type="button" class="mode-btn" id="mode_btn_standalone" onclick="setMode('standalone')">Standalone Arena</button>
     </div>
+    <div style="display:flex;gap:6px;margin-bottom:12px;font-size:11px;align-items:center;">
+      <span id="key_badge" class="pill ap" style="cursor:pointer;" onclick="switchTab('tab_settings')">Key: Checking...</span>
+      <span id="stream_badge" class="pill" style="display:none;">SSE: Off</span>
+    </div>
 
     <!-- Match Banner -->
     <div class="match-banner">
@@ -704,8 +769,12 @@ String WiFiPortal::_getHTMLPage() {
 
     <div class="card">
       <div class="card-title">BotSports Arena Config</div>
-      <label>Arena API Key</label>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+        <label style="margin-bottom:0;">Arena API Key</label>
+        <span id="cfg_key_badge" class="pill ap" style="font-size:10px;padding:2px 7px;">Checking...</span>
+      </div>
       <input type="text" id="api_key" placeholder="bs_arena_...">
+      <div id="cfg_key_msg" style="font-size:11px;color:var(--dim);margin-top:-8px;margin-bottom:12px;"></div>
 
       <label>Server Environment</label>
       <select id="api_env" onchange="onEnvChange()">
@@ -775,6 +844,7 @@ window.onload = function() {
 function fetchInitialStatus() {
   fetch('/api/status').then(r => r.json()).then(data => {
     if (data.configured_ssid) document.getElementById('wifi_ssid').value = data.configured_ssid;
+    if (data.api_key) document.getElementById('api_key').value = data.api_key;
     if (data.api_url) {
       if (data.api_url === 'https://api-dev.botsports.org' || data.api_url === 'https://api.botsports.org') {
         document.getElementById('api_env').value = data.api_url;
@@ -782,6 +852,23 @@ function fetchInitialStatus() {
         document.getElementById('api_env').value = 'custom';
         document.getElementById('custom_url_field').style.display = 'block';
         document.getElementById('api_url').value = data.api_url;
+      }
+    }
+    const cfgKeyBadge = document.getElementById('cfg_key_badge');
+    const cfgKeyMsg = document.getElementById('cfg_key_msg');
+    if (cfgKeyBadge && cfgKeyMsg) {
+      if (data.api_key_valid) {
+        cfgKeyBadge.className = 'pill online';
+        cfgKeyBadge.innerText = 'Verified ✓';
+        cfgKeyMsg.innerText = 'Valid API key verified by server.';
+      } else if (data.has_api_key) {
+        cfgKeyBadge.className = 'pill ap';
+        cfgKeyBadge.innerText = 'Invalid ✗';
+        cfgKeyMsg.innerText = data.key_validation_error ? ('Error: ' + data.key_validation_error) : 'Key could not be verified.';
+      } else {
+        cfgKeyBadge.className = 'pill ap';
+        cfgKeyBadge.innerText = 'Not Set';
+        cfgKeyMsg.innerText = 'API Key required for BotSports API Sync mode.';
       }
     }
     if (data.corner) document.getElementById('corner_select').value = data.corner;
@@ -811,6 +898,33 @@ function pollControlStatus() {
     document.getElementById('mode_btn_api').className = 'mode-btn' + (!isStandalone ? ' active' : '');
     document.getElementById('mode_btn_standalone').className = 'mode-btn' + (isStandalone ? ' active' : '');
     document.getElementById('standalone_card').style.display = isStandalone ? 'block' : 'none';
+
+    // Key & Stream Badges
+    const keyBadge = document.getElementById('key_badge');
+    const streamBadge = document.getElementById('stream_badge');
+    if (keyBadge) {
+      if (data.api_key_valid) {
+        keyBadge.className = 'pill online';
+        keyBadge.innerText = 'Key: Valid ✓';
+      } else {
+        keyBadge.className = 'pill ap';
+        keyBadge.innerText = 'Key: Invalid / Unset ✗';
+      }
+    }
+    if (streamBadge) {
+      if (!isStandalone) {
+        streamBadge.style.display = 'inline-flex';
+        if (data.stream_connected) {
+          streamBadge.className = 'pill online';
+          streamBadge.innerText = 'SSE Stream: Live ●';
+        } else {
+          streamBadge.className = 'pill ap';
+          streamBadge.innerText = 'SSE: Connecting...';
+        }
+      } else {
+        streamBadge.style.display = 'none';
+      }
+    }
 
     // Match banner
     document.getElementById('hud_red_name').innerText = data.red_name;
@@ -847,7 +961,10 @@ function pollControlStatus() {
       else if (rem <= 30) { clockEl.classList.add('clock-orange'); statusEl.classList.add('clock-orange'); }
       else { clockEl.classList.add('clock-green'); statusEl.classList.add('clock-green'); }
     } else if (data.clock_state === 'paused') {
-      statusEl.innerText = 'CLOCK PAUSED';
+      const reason = (data.clock_pause_reason && data.clock_pause_reason.length > 0)
+        ? ('PAUSED: ' + data.clock_pause_reason.replace(/_/g, ' ').toUpperCase())
+        : 'CLOCK PAUSED';
+      statusEl.innerText = reason;
       clockEl.classList.add('clock-paused');
       statusEl.classList.add('clock-paused');
     } else if (data.clock_state === 'expired') {
@@ -891,7 +1008,17 @@ function setMode(mode) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ mode: mode })
-  }).then(r => r.json()).then(() => pollControlStatus());
+  }).then(async r => {
+    const data = await r.json();
+    if (!r.ok) {
+      showToast(data.message || 'Failed to switch mode', true);
+    } else {
+      showToast('Switched to ' + (mode === 'api' ? 'BotSports API Sync' : 'Standalone Arena'), false);
+    }
+    pollControlStatus();
+  }).catch(e => {
+    showToast('Failed to change mode', true);
+  });
 }
 
 function saveMatchDetails() {
@@ -992,12 +1119,22 @@ function saveSettings() {
   .then(res => {
     if (res.status === 'ok') {
       showToast(res.message, false);
-      btn.innerText = 'Rebooting...';
+      if (res.message && res.message.includes('Rebooting')) {
+        btn.innerText = 'Rebooting...';
+      } else {
+        btn.innerText = 'Saved!';
+        setTimeout(() => { btn.innerText = 'Save & Reboot'; btn.disabled = false; }, 2000);
+      }
+      fetchInitialStatus();
     } else {
       showToast(res.message || 'Save error', true);
       btn.innerText = 'Save & Reboot';
       btn.disabled = false;
     }
+  }).catch(() => {
+    showToast('Network error saving settings', true);
+    btn.innerText = 'Save & Reboot';
+    btn.disabled = false;
   });
 }
 

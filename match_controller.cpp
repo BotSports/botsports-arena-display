@@ -38,28 +38,43 @@ void MatchController::unlock() const {
 void MatchController::begin() {
     if (!_mutex) _mutex = xSemaphoreCreateRecursiveMutex();
     _mode = (OperatingMode)configMgr.settings.op_mode;
-    if (_mode != OPMODE_API && _mode != OPMODE_STANDALONE) {
+    if (_mode == OPMODE_API && configMgr.settings.api_key.length() == 0) {
+        _mode = OPMODE_STANDALONE;
+        configMgr.settings.op_mode = (uint8_t)OPMODE_STANDALONE;
+        configMgr.saveSettings();
+        Serial.println("[MatchCtrl] No API key configured. Defaulted to Standalone Arena Mode.");
+    } else if (_mode != OPMODE_API && _mode != OPMODE_STANDALONE) {
         _mode = OPMODE_STANDALONE;
     }
     Serial.printf("[MatchCtrl] Starting in %s Mode (restored from NVS).\n", (_mode == OPMODE_API) ? "BotSports API Sync" : "Standalone Arena");
 }
 
-void MatchController::setMode(OperatingMode mode) {
-    _mode = mode;
-    if (_mode == OPMODE_API) {
+bool MatchController::setMode(OperatingMode mode) {
+    if (mode == OPMODE_API) {
+        if (!apiClient.isKeyValid()) {
+            Serial.println("[MatchCtrl] REJECTED switch to BotSports API Mode: No verified valid API key!");
+            return false;
+        }
+        _mode = OPMODE_API;
         _activeTestName = "";
         clearKO();
         configMgr.settings.op_mode = (uint8_t)OPMODE_API;
         configMgr.saveSettings();
         Serial.println("[MatchCtrl] Switched to BotSports API Mode (saved to NVS)");
-    } else if (_mode == OPMODE_STANDALONE) {
+        return true;
+    } else if (mode == OPMODE_STANDALONE) {
+        _mode = OPMODE_STANDALONE;
         _activeTestName = "";
         configMgr.settings.op_mode = (uint8_t)OPMODE_STANDALONE;
         configMgr.saveSettings();
         Serial.println("[MatchCtrl] Switched to Standalone Arena Mode (saved to NVS)");
-    } else if (_mode == OPMODE_TEST) {
+        return true;
+    } else if (mode == OPMODE_TEST) {
+        _mode = OPMODE_TEST;
         Serial.println("[MatchCtrl] Switched to Screen Test Mode");
+        return true;
     }
+    return false;
 }
 
 String MatchController::getModeString() const {

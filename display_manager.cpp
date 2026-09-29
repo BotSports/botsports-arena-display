@@ -337,6 +337,7 @@ void DisplayManager::_renderActiveMatch() {
     int rNum = matchCtrl.getCurrentRoundNumber();
     String redName = matchCtrl.getCurrentRedName();
     String blueName = matchCtrl.getCurrentBlueName();
+    ClockState cState = matchCtrl.getCurrentClockState();
 
     // 1. Top Header Bar: Round & Match number (Round first: R1 M1) + Arena Name (right)
     _dmaDisplay->setTextSize(1);
@@ -344,12 +345,20 @@ void DisplayManager::_renderActiveMatch() {
     _dmaDisplay->setCursor(1, 1);
     _dmaDisplay->printf("R%d M%d", rNum, mNum);
 
-    String headerRight = (matchCtrl.getMode() == OPMODE_STANDALONE) ? "LOCAL" : apiClient.getData().arena_name;
-    if (headerRight.length() == 0) headerRight = "ARENA";
-    if (headerRight.length() > 6) headerRight = headerRight.substring(0, 6);
-    _dmaDisplay->setTextColor(_colorWhite);
-    _dmaDisplay->setCursor(44, 1);
-    _dmaDisplay->print(headerRight);
+    String pauseReason = apiClient.getData().clock_pause_reason;
+    if (cState == CLOCK_PAUSED && pauseReason.length() > 0) {
+        String label = pauseReason;
+        label.replace('_', ' ');
+        label.toUpperCase();
+        _drawScrollingText(38, 1, "PAUSE: " + label, _colorYellow, _marqueeOffsetBanner, PANEL_RES_X - 38, _colorBlack);
+    } else {
+        String headerRight = (matchCtrl.getMode() == OPMODE_STANDALONE) ? "LOCAL" : apiClient.getData().arena_name;
+        if (headerRight.length() == 0) headerRight = "ARENA";
+        if (headerRight.length() > 6) headerRight = headerRight.substring(0, 6);
+        _dmaDisplay->setTextColor(_colorWhite);
+        _dmaDisplay->setCursor(44, 1);
+        _dmaDisplay->print(headerRight);
+    }
 
     _dmaDisplay->drawFastHLine(0, 9, PANEL_RES_X, _colorDarkGray);
 
@@ -357,7 +366,6 @@ void DisplayManager::_renderActiveMatch() {
     float remSec = matchCtrl.getCurrentRemainingSeconds();
     int minutes = (int)remSec / 60;
     int seconds = (int)remSec % 60;
-    ClockState cState = matchCtrl.getCurrentClockState();
 
     uint16_t clockColor = _colorGreen;
     if (cState == CLOCK_PAUSED) {

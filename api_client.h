@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -51,6 +52,7 @@ struct ArenaStatusData {
     ClockState clock_state;
     float clock_duration_sec;
     float clock_remaining_sec;
+    String clock_pause_reason;
     unsigned long clock_sync_millis; // local millis() at time of sync
 
     // Upcoming Match
@@ -65,6 +67,37 @@ public:
     BotSportsAPIClient();
     bool pollStatus();
     void setSyncedData(const ArenaSyncPacket& pkt);
+
+    // API Key Validation
+    bool validateApiKey(const String& key, const String& url, String& outError);
+    bool isKeyValid() const {
+        lock();
+        bool valid = _keyValid;
+        unlock();
+        return valid;
+    }
+    void setKeyValid(bool valid) {
+        lock();
+        _keyValid = valid;
+        unlock();
+    }
+    String getKeyValidationError() const {
+        lock();
+        String err = _keyValidationError;
+        unlock();
+        return err;
+    }
+
+    // SSE Real-Time Streaming
+    bool connectStream();
+    void disconnectStream();
+    void handleStream();
+    bool isStreamConnected() const {
+        lock();
+        bool c = _streamConnected;
+        unlock();
+        return c;
+    }
 
     void lock() const {
         if (_mutex) xSemaphoreTakeRecursive(_mutex, portMAX_DELAY);
@@ -88,7 +121,20 @@ private:
     WiFiClientSecure _secureClient;
     unsigned long _lastPollTime;
 
+    // SSE state
+    bool _keyValid;
+    String _keyValidationError;
+    bool _streamConnected;
+    unsigned long _lastStreamConnectAttempt;
+    unsigned long _lastStreamDataReceived;
+    WiFiClientSecure _streamClientSecure;
+    WiFiClient _streamClient;
+    Client* _stream;
+    String _currentSseEvent;
+    String _currentSseData;
+
     void _parseStatusJson(const String& payload, ArenaStatusData& target);
+    void _dispatchStreamEvent(const String& eventType, const String& dataStr);
 };
 
 extern BotSportsAPIClient apiClient;

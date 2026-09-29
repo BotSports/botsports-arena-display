@@ -27,31 +27,28 @@ void networkTask(void *param) {
 
 // ============================================================================
 // Core 0 Task: Background BotSports API Polling
-// Runs HTTPS client on Core 0 so TLS negotiations never block display rendering!
+// ============================================================================
+// Core 0 Task: Background BotSports SSE Real-Time Stream & Event Dispatch
+// Runs on Core 0 so TLS stream socket and event dispatch never block the display!
 // ============================================================================
 void apiTask(void *param) {
-    Serial.printf("[Tasks] API task started on Core %d\n", xPortGetCoreID());
+    Serial.printf("[Tasks] Real-time SSE / API task started on Core %d\n", xPortGetCoreID());
     for (;;) {
         if (matchCtrl.getMode() == OPMODE_API && wifiPortal.isConnected() && !arenaSync.isSlave()) {
-            ArenaStatusData data = apiClient.getData();
-
-            unsigned long pollInterval = API_POLL_INTERVAL_MS;
-            if (!data.valid) {
-                pollInterval = 5000; // Backoff on error
-            } else if (data.has_current_match && apiClient.getEffectiveClockState() == CLOCK_RUNNING) {
-                pollInterval = API_POLL_INTERVAL_MATCH_MS;
-            } else if (!data.has_active_event) {
-                pollInterval = API_POLL_INTERVAL_IDLE_MS;
+            if (apiClient.isKeyValid()) {
+                apiClient.handleStream();
+            } else {
+                // Key is invalid - cannot run API mode!
+                Serial.println("[Tasks] API Key not valid! Reverting to Standalone Arena Mode.");
+                matchCtrl.setMode(OPMODE_STANDALONE);
+                apiClient.disconnectStream();
             }
-
-            if (millis() - lastApiPollTime >= pollInterval) {
-                lastApiPollTime = millis();
-                if (apiClient.pollStatus()) {
-                    arenaSync.broadcastState(false);
-                }
+        } else {
+            if (apiClient.isStreamConnected()) {
+                apiClient.disconnectStream();
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -94,11 +91,16 @@ void setup() {
         displayMgr.showConnecting(configMgr.settings.wifi_ssid, 100);
         delay(300);
 
-        // Initial status fetch if starting in API mode as master
+        // In API mode, validate API key before starting
         if (matchCtrl.getMode() == OPMODE_API && !arenaSync.isSlave()) {
-            Serial.println("[System] Master fetching initial arena status from BotSports API...");
-            if (apiClient.pollStatus()) {
+            Serial.println("[System] Master validating API key against BotSports API...");
+            String err;
+            if (apiClient.validateApiKey(configMgr.settings.api_key, configMgr.settings.api_url, err)) {
+                Serial.printf("[System] BotSports API key verified for arena: '%s'\n", apiClient.getData().arena_name.c_str());
                 arenaSync.broadcastState(true);
+            } else {
+                Serial.printf("[System] BotSports API key invalid (%s). Switching to Standalone Mode.\n", err.c_str());
+                matchCtrl.setMode(OPMODE_STANDALONE);
             }
         }
     }

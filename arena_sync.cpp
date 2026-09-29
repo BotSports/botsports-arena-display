@@ -134,6 +134,7 @@ void ArenaSyncManager::broadcastState(bool immediate) {
     }
 
     pkt.screen_mode = (uint8_t)displayMgr.getScreen();
+    strncpy(pkt.pause_reason, apiData.clock_pause_reason.c_str(), sizeof(pkt.pause_reason) - 1);
 
     // Broadcast target
     IPAddress bcastIP = WiFi.broadcastIP();
@@ -152,7 +153,7 @@ void ArenaSyncManager::update() {
     // 1. Process all incoming UDP packets
     int packetSize = _udp.parsePacket();
     while (packetSize > 0) {
-        uint8_t buf[256];
+        uint8_t buf[512];
         int len = _udp.read(buf, sizeof(buf));
         if (len > 0) {
             _processIncomingPacket(buf, (size_t)len, _udp.remoteIP());

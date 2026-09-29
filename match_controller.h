@@ -17,7 +17,7 @@ public:
     void update();
 
     // Mode Selection
-    void setMode(OperatingMode mode);
+    bool setMode(OperatingMode mode);
     OperatingMode getMode() const { return _mode; }
     String getModeString() const;
 

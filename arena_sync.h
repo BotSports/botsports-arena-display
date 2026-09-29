@@ -33,6 +33,7 @@ struct __attribute__((packed)) ArenaSyncPacket {
     uint16_t upcoming_match_num; // Next match number
     uint16_t upcoming_round_num; // Next round number
     uint8_t screen_mode;         // SCREEN_ACTIVE_MATCH, SCREEN_UPCOMING_MATCH, SCREEN_IDLE_EVENT, SCREEN_KO
+    char pause_reason[16];       // Clock pause reason (e.g. "debris_sweep")
 };
 
 // Heartbeat packet sent from Slave to Master
