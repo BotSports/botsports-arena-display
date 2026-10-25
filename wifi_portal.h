@@ -29,6 +29,7 @@ public:
     WiFiPortalState getState() const { return _state; }
     bool isConnected() const { return _state == WIFI_STATE_CONNECTED; }
     bool isAPMode() const { return _state == WIFI_STATE_AP_MODE; }
+    bool isOTAInProgress() const { return _otaInProgress; }
     String getAPSSID() const { return _apSSID; }
     String getIPAddress() const;
     int8_t getRSSI() const;
@@ -43,6 +44,12 @@ private:
     unsigned long _rebootTime;
     bool _serverStarted;
     volatile bool _apModeRequested;
+    volatile bool _otaInProgress;
+    bool _otaSuccess;
+    String _otaError;
+    size_t _otaTotalBytes;
+    size_t _otaExpectedSize;
+    int _lastOtaDisplayPct;
 
     void _setupWebServer();
     void _startServer();
@@ -57,12 +64,15 @@ private:
     void _handleControlTimer();
     void _handleControlKO();
     void _handleControlMatch();
+    void _handleControlReady();
+    void _handleControlResult();
     void _handleControlMode();
     void _handleControlTest();
     void _handleControlBrightness();
+    void _handleOTAComplete();
+    void _handleOTAUpload();
     void _handleCaptivePortal();
 
-    String _getHTMLPage();
 };
 
 extern WiFiPortal wifiPortal;

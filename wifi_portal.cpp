@@ -1,5 +1,6 @@
 #include "wifi_portal.h"
 #include <ArduinoJson.h>
+#include <Update.h>
 #include "match_controller.h"
 #include "display_manager.h"
 #include "arena_sync.h"
@@ -14,6 +15,12 @@ WiFiPortal::WiFiPortal() : _server(HTTP_PORT) {
     _rebootTime = 0;
     _serverStarted = false;
     _apModeRequested = false;
+    _otaInProgress = false;
+    _otaSuccess = false;
+    _otaError = "";
+    _otaTotalBytes = 0;
+    _otaExpectedSize = 0;
+    _lastOtaDisplayPct = -1;
 }
 
 void WiFiPortal::begin() {
@@ -163,12 +170,18 @@ void WiFiPortal::_setupWebServer() {
     _server.on("/api/save", HTTP_POST, [this]() { _handleSave(); });
     _server.on("/api/reset", HTTP_POST, [this]() { _handleReset(); });
     _server.on("/api/status", HTTP_GET, [this]() { _handleStatus(); });
+    _server.on("/api/ota", HTTP_POST,
+        [this]() { _handleOTAComplete(); },
+        [this]() { _handleOTAUpload(); }
+    );
 
     // Arena Control Panel APIs
     _server.on("/api/control/status", HTTP_GET, [this]() { _handleControlStatus(); });
     _server.on("/api/control/timer", HTTP_POST, [this]() { _handleControlTimer(); });
     _server.on("/api/control/ko", HTTP_POST, [this]() { _handleControlKO(); });
     _server.on("/api/control/match", HTTP_POST, [this]() { _handleControlMatch(); });
+    _server.on("/api/control/ready", HTTP_POST, [this]() { _handleControlReady(); });
+    _server.on("/api/control/result", HTTP_POST, [this]() { _handleControlResult(); });
     _server.on("/api/control/mode", HTTP_POST, [this]() { _handleControlMode(); });
     _server.on("/api/control/test", HTTP_POST, [this]() { _handleControlTest(); });
     _server.on("/api/control/brightness", HTTP_POST, [this]() { _handleControlBrightness(); });
@@ -189,9 +202,6 @@ void WiFiPortal::_setupWebServer() {
     });
 }
 
-void WiFiPortal::_handleRoot() {
-    _server.send(200, "text/html", _getHTMLPage());
-}
 
 void WiFiPortal::_handleCaptivePortal() {
     _server.sendHeader("Location", String("http://") + getIPAddress() + "/", true);
@@ -360,19 +370,37 @@ void WiFiPortal::_handleControlStatus() {
     if (cState == CLOCK_RUNNING) clockStateStr = "running";
     else if (cState == CLOCK_PAUSED) clockStateStr = "paused";
     else if (cState == CLOCK_EXPIRED) clockStateStr = "expired";
+    else if (cState == CLOCK_COUNT_IN) clockStateStr = "count_in";
     doc["clock_state"] = clockStateStr;
 
     doc["remaining_seconds"] = matchCtrl.getCurrentRemainingSeconds();
     doc["duration_seconds"] = matchCtrl.getDuration();
+    doc["count_in_seconds"] = matchCtrl.getCurrentCountInSeconds();
+    doc["hazards_seconds"] = matchCtrl.getHazardsThreshold();
+    doc["is_hazards_active"] = matchCtrl.isCurrentHazardsActive();
     doc["match_number"] = matchCtrl.getCurrentMatchNumber();
     doc["round_number"] = matchCtrl.getCurrentRoundNumber();
+    doc["match_status"] = matchCtrl.getCurrentMatchStatus();
+    doc["pause_reason"] = matchCtrl.getCurrentPauseReason();
     doc["red_name"] = matchCtrl.getCurrentRedName();
     doc["blue_name"] = matchCtrl.getCurrentBlueName();
+
+    doc["red_pit_ready"] = matchCtrl.getCurrentRedPitReady();
+    doc["red_checked_in"] = matchCtrl.getCurrentRedCheckedIn();
+    doc["red_match_ready"] = matchCtrl.getCurrentRedMatchReady();
+    doc["blue_pit_ready"] = matchCtrl.getCurrentBluePitReady();
+    doc["blue_checked_in"] = matchCtrl.getCurrentBlueCheckedIn();
+    doc["blue_match_ready"] = matchCtrl.getCurrentBlueMatchReady();
 
     doc["is_ko"] = matchCtrl.isKO();
     doc["ko_winner"] = matchCtrl.getKOWinner();
     doc["ko_winner_name"] = matchCtrl.getKOWinnerName();
     doc["ko_time"] = matchCtrl.getKOTime();
+
+    doc["outcome_type"] = matchCtrl.getCurrentOutcomeType();
+    doc["winner_corner"] = matchCtrl.getCurrentWinnerCorner();
+    doc["winner_name"] = matchCtrl.getCurrentWinnerName();
+    doc["outcome_time"] = matchCtrl.getCurrentOutcomeTime();
 
     doc["active_test"] = matchCtrl.getActiveTestName();
     doc["brightness"] = configMgr.settings.brightness;
@@ -398,14 +426,21 @@ void WiFiPortal::_handleControlTimer() {
 
     String action = doc["action"] | "";
     if (action.equalsIgnoreCase("start") || action.equalsIgnoreCase("resume")) {
-        matchCtrl.startTimer();
+        bool countIn = doc["count_in"] | false;
+        matchCtrl.startTimer(countIn);
+    } else if (action.equalsIgnoreCase("count_in")) {
+        matchCtrl.triggerCountIn();
     } else if (action.equalsIgnoreCase("pause")) {
-        matchCtrl.pauseTimer();
+        String reason = doc["reason"] | "";
+        matchCtrl.pauseTimer(reason);
     } else if (action.equalsIgnoreCase("reset")) {
         matchCtrl.resetTimer();
     } else if (action.equalsIgnoreCase("set_duration")) {
         float secs = doc["seconds"] | 180.0f;
         matchCtrl.setDuration(secs);
+    } else if (action.equalsIgnoreCase("set_hazards")) {
+        float hSecs = doc["hazards_seconds"] | 60.0f;
+        matchCtrl.setHazardsThreshold(hSecs);
     }
 
     arenaSync.broadcastState(true); // Immediate sync to slave displays
@@ -425,6 +460,56 @@ void WiFiPortal::_handleControlKO() {
     }
 
     arenaSync.broadcastState(true); // Immediate sync to slave displays
+    _handleControlStatus();
+}
+
+void WiFiPortal::_handleControlReady() {
+    JsonDocument doc;
+    deserializeJson(doc, _server.arg("plain"));
+
+    String corner = doc["corner"] | "";
+    String tier = doc["tier"] | "";
+    bool val = doc["value"] | false;
+
+    if (corner.equalsIgnoreCase("red")) {
+        bool p = matchCtrl.getCurrentRedPitReady();
+        bool g = matchCtrl.getCurrentRedCheckedIn();
+        bool r = matchCtrl.getCurrentRedMatchReady();
+        if (tier == "pit") p = val;
+        else if (tier == "gate" || tier == "check_in") g = val;
+        else if (tier == "ready" || tier == "match") r = val;
+        matchCtrl.setRedReadiness(p, g, r);
+    } else if (corner.equalsIgnoreCase("blue")) {
+        bool p = matchCtrl.getCurrentBluePitReady();
+        bool g = matchCtrl.getCurrentBlueCheckedIn();
+        bool r = matchCtrl.getCurrentBlueMatchReady();
+        if (tier == "pit") p = val;
+        else if (tier == "gate" || tier == "check_in") g = val;
+        else if (tier == "ready" || tier == "match") r = val;
+        matchCtrl.setBlueReadiness(p, g, r);
+    }
+
+    arenaSync.broadcastState(true);
+    _handleControlStatus();
+}
+
+void WiFiPortal::_handleControlResult() {
+    JsonDocument doc;
+    deserializeJson(doc, _server.arg("plain"));
+
+    String action = doc["action"] | "";
+    if (action.equalsIgnoreCase("finish")) {
+        matchCtrl.finishMatch();
+    } else if (action.equalsIgnoreCase("record")) {
+        String corner = doc["corner"] | "";
+        String outcome = doc["outcome"] | "decision";
+        matchCtrl.recordResult(corner, outcome);
+    } else if (action.equalsIgnoreCase("clear")) {
+        matchCtrl.clearResult();
+        displayMgr.setScreen(SCREEN_ACTIVE_MATCH);
+    }
+
+    arenaSync.broadcastState(true);
     _handleControlStatus();
 }
 
@@ -498,8 +583,89 @@ void WiFiPortal::_handleControlBrightness() {
     _server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
-String WiFiPortal::_getHTMLPage() {
-    return R"rawhtml(
+void WiFiPortal::_handleOTAComplete() {
+    _otaInProgress = false;
+    if (_otaSuccess && !Update.hasError()) {
+        Serial.println("[OTA] Firmware update complete! Rebooting in 1.5s...");
+        displayMgr.showOTAProgress("DONE! REBOOT", 100);
+        _server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Firmware updated! Rebooting device...\"}");
+        _shouldReboot = true;
+        _rebootTime = millis() + 1500;
+    } else {
+        String err = _otaError.length() > 0 ? _otaError : String(Update.errorString());
+        Serial.printf("[OTA] Firmware update failed: %s\n", err.c_str());
+        displayMgr.showError("OTA FAILED", err);
+        _server.send(500, "application/json", "{\"status\":\"error\",\"message\":\"OTA failed: " + err + "\"}");
+    }
+}
+
+void WiFiPortal::_handleOTAUpload() {
+    HTTPUpload& upload = _server.upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+        _otaInProgress = true;
+        _otaSuccess = false;
+        _otaError = "";
+        _otaTotalBytes = 0;
+        _lastOtaDisplayPct = -1;
+        _otaExpectedSize = _server.hasArg("size") ? (size_t)_server.arg("size").toInt() : 0;
+
+        Serial.printf("[OTA] Starting firmware upload: %s (expected size: %u bytes)\n",
+                      upload.filename.c_str(), (unsigned int)_otaExpectedSize);
+
+        // Disconnect background SSE stream during flash write to free RAM & avoid socket contention
+        apiClient.disconnectStream();
+        displayMgr.showOTAProgress("FLASHING...", 0);
+
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+            _otaError = Update.errorString();
+            Serial.printf("[OTA] Update.begin() failed: %s\n", _otaError.c_str());
+        }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (_otaError.length() == 0) {
+            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                _otaError = Update.errorString();
+                Serial.printf("[OTA] Update.write() failed: %s\n", _otaError.c_str());
+            } else {
+                _otaTotalBytes += upload.currentSize;
+                int pct = -1;
+                if (_otaExpectedSize > 0) {
+                    pct = (int)((_otaTotalBytes * 100ULL) / _otaExpectedSize);
+                    if (pct > 99) pct = 99;
+                } else {
+                    // Fallback estimate based on ~1.25MB typical firmware binary
+                    pct = (int)((_otaTotalBytes * 100ULL) / 1250000ULL);
+                    if (pct > 99) pct = 99;
+                }
+                if (pct >= 0 && (pct - _lastOtaDisplayPct >= 5 || _lastOtaDisplayPct == -1)) {
+                    _lastOtaDisplayPct = pct;
+                    displayMgr.showOTAProgress("FLASHING...", pct);
+                    Serial.printf("[OTA] Progress: %u bytes (%d%%)\n", (unsigned int)_otaTotalBytes, pct);
+                }
+            }
+        }
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (_otaError.length() == 0) {
+            if (Update.end(true)) {
+                _otaSuccess = true;
+                Serial.printf("[OTA] Upload finished: %u bytes written.\n", (unsigned int)upload.totalSize);
+            } else {
+                _otaError = Update.errorString();
+                Serial.printf("[OTA] Update.end() failed: %s\n", _otaError.c_str());
+            }
+        } else {
+            Update.abort();
+        }
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        Update.abort();
+        _otaInProgress = false;
+        _otaError = "Upload aborted";
+        Serial.println("[OTA] Upload aborted by client.");
+        displayMgr.showError("OTA ABORTED", "Upload cancelled");
+    }
+}
+
+static const char PAGE_HTML[] PROGMEM = R"rawhtml(
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -607,6 +773,7 @@ String WiFiPortal::_getHTMLPage() {
   <div class="status-bar">
     <div>
       <strong id="device_name" style="color:var(--text);">BotSports Display</strong>
+      <span id="fw_version_badge" style="margin-left:5px;font-size:11px;color:var(--dim);">v1.3.1</span>
       <span id="mdns_link" style="margin-left:6px;"><a href="http://botsports-arena.local" style="color:var(--gold);text-decoration:none;">.local</a></span>
     </div>
     <span class="pill" id="conn_pill">Connecting...</span>
@@ -656,9 +823,24 @@ String WiFiPortal::_getHTMLPage() {
 
     <!-- Timer Control Buttons -->
     <div class="btn-row">
-      <button type="button" class="btn-green" id="btn_timer_start" onclick="sendTimer('start')">&#9654; START</button>
+      <button type="button" class="btn-green" id="btn_timer_countin" onclick="sendTimer('start', true)">&#9654; 3-2-1 START</button>
+      <button type="button" class="btn-gray" id="btn_timer_instant" onclick="sendTimer('start', false)">&#9654; START</button>
       <button type="button" class="btn-yellow" id="btn_timer_pause" onclick="sendTimer('pause')">&#10074;&#10074; PAUSE</button>
       <button type="button" class="btn-gray" onclick="sendTimer('reset')">&#8635; RESET</button>
+    </div>
+
+    <!-- Pause Reason Dropdown -->
+    <div style="margin-bottom:10px;">
+      <label>Pause Reason (Applied when pausing)</label>
+      <select id="pause_reason_sel" style="margin-bottom:0;">
+        <option value="">No Reason Specified</option>
+        <option value="referee">Referee / Official</option>
+        <option value="arena_hazard">Arena Hazard / Debris</option>
+        <option value="radio_failsafe">Radio / Signal Loss</option>
+        <option value="pin_entanglement">Pin / Entanglement</option>
+        <option value="medical_safety">Safety / Medical</option>
+        <option value="technical">Technical Issue</option>
+      </select>
     </div>
 
     <!-- Quick Duration Buttons -->
@@ -668,14 +850,58 @@ String WiFiPortal::_getHTMLPage() {
       <button type="button" class="btn-gray" style="padding:7px;font-size:12px;" onclick="setDuration(180)">3:00 (Standard)</button>
     </div>
 
-    <!-- Knockout (KO) Action Section -->
-    <div class="ko-panel">
-      <div class="ko-title">&#129354; KNOCKOUT (KO) VICTORY</div>
-      <div class="btn-row">
-        <button type="button" class="btn-red" onclick="sendKO('red')">&#129354; RED WINS (KO)</button>
-        <button type="button" class="btn-blue" onclick="sendKO('blue')">&#129354; BLUE WINS (KO)</button>
+    <!-- 3-Tier Readiness Panel -->
+    <div class="card" style="margin-top:14px;">
+      <div class="card-title">
+        <span>3-Tier Readiness Check</span>
+        <span style="font-size:11px;color:var(--dim);">Pit &bull; Gate &bull; Box</span>
       </div>
-      <button type="button" class="btn-gray" style="width:100%;margin-top:4px;padding:8px;font-size:12px;" onclick="sendKO('clear')">Clear KO Screen</button>
+      <div class="grid-2">
+        <div style="background:#1a0f12;border:1px solid #4a1d24;border-radius:8px;padding:10px;">
+          <strong style="color:#f87171;font-size:13px;display:block;margin-bottom:8px;">Red Corner</strong>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:6px;cursor:pointer;">
+            <input type="checkbox" id="chk_red_pit" onchange="sendReadiness('red','pit',this.checked)"> Pit Ready
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:6px;cursor:pointer;">
+            <input type="checkbox" id="chk_red_gate" onchange="sendReadiness('red','gate',this.checked)"> Gate Checked-In
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:0;cursor:pointer;">
+            <input type="checkbox" id="chk_red_ready" onchange="sendReadiness('red','ready',this.checked)"> Box / Match Ready
+          </label>
+        </div>
+        <div style="background:#0f1526;border:1px solid #1e3a8a;border-radius:8px;padding:10px;">
+          <strong style="color:#60a5fa;font-size:13px;display:block;margin-bottom:8px;">Blue Corner</strong>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:6px;cursor:pointer;">
+            <input type="checkbox" id="chk_blue_pit" onchange="sendReadiness('blue','pit',this.checked)"> Pit Ready
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:6px;cursor:pointer;">
+            <input type="checkbox" id="chk_blue_gate" onchange="sendReadiness('blue','gate',this.checked)"> Gate Checked-In
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:0;cursor:pointer;">
+            <input type="checkbox" id="chk_blue_ready" onchange="sendReadiness('blue','ready',this.checked)"> Box / Match Ready
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <!-- Match Results & Outcomes Section -->
+    <div class="ko-panel">
+      <div class="ko-title">&#127942; MATCH RESULTS &amp; OUTCOMES</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:6px;">Knockouts (KO)</div>
+      <div class="btn-row">
+        <button type="button" class="btn-red" onclick="sendResult('record','red','ko')">&#129354; RED KO</button>
+        <button type="button" class="btn-blue" onclick="sendResult('record','blue','ko')">&#129354; BLUE KO</button>
+      </div>
+      <div style="font-size:11px;color:var(--dim);margin-top:8px;margin-bottom:6px;">Judges Decisions &amp; Stoppage</div>
+      <div class="btn-row">
+        <button type="button" class="btn-red" style="font-size:12px;padding:8px;" onclick="sendResult('record','red','decision')">RED DECISION</button>
+        <button type="button" class="btn-blue" style="font-size:12px;padding:8px;" onclick="sendResult('record','blue','decision')">BLUE DECISION</button>
+        <button type="button" class="btn-yellow" style="font-size:12px;padding:8px;" onclick="sendResult('record','tied','draw')">DRAW</button>
+      </div>
+      <div class="btn-row" style="margin-top:6px;">
+        <button type="button" class="btn-gray" style="font-size:12px;padding:8px;" onclick="sendResult('finish')">&#9209; COMBAT FINISHED (SCORING)</button>
+        <button type="button" class="btn-gray" style="font-size:12px;padding:8px;" onclick="sendResult('clear')">CLEAR RESULT</button>
+      </div>
     </div>
 
     <!-- Standalone Match Details Editor -->
@@ -704,6 +930,10 @@ String WiFiPortal::_getHTMLPage() {
           <input type="text" id="input_blue_name" value="Minotaur">
         </div>
       </div>
+      <div>
+        <label>Hazards Threshold (Seconds Remaining)</label>
+        <input type="text" id="input_hazards_sec" value="60">
+      </div>
       <button type="button" class="btn-yellow" onclick="saveMatchDetails()">Update Match Info</button>
     </div>
   </div>
@@ -715,23 +945,34 @@ String WiFiPortal::_getHTMLPage() {
       <p style="font-size:12px;color:var(--dim);margin-bottom:14px;">Trigger real-time animations on the WaveShare 80x40 matrix to verify rendering and visuals.</p>
 
       <div class="btn-row">
+        <button type="button" class="btn-yellow" onclick="sendTest('count_in')">&#9201; Test 3-2-1 Count-In</button>
+        <button type="button" class="btn-gray" onclick="sendTest('hazards')">&#9888; Test Hazards Alert</button>
+      </div>
+      <div class="btn-row">
         <button type="button" class="btn-red" onclick="sendTest('ko_red')">&#129354; Test Red KO FX</button>
         <button type="button" class="btn-blue" onclick="sendTest('ko_blue')">&#129354; Test Blue KO FX</button>
       </div>
       <div class="btn-row">
-        <button type="button" class="btn-yellow" onclick="sendTest('expired')">&#9200; Test TIME! Flash</button>
+        <button type="button" class="btn-red" onclick="sendTest('decision_red')">&#127942; Test Red Decision</button>
+        <button type="button" class="btn-blue" onclick="sendTest('decision_blue')">&#127942; Test Blue Decision</button>
+      </div>
+      <div class="btn-row">
+        <button type="button" class="btn-yellow" onclick="sendTest('finished')">&#9209; Test Combat Finished</button>
+        <button type="button" class="btn-gray" onclick="sendTest('expired')">&#9200; Test TIME! Flash</button>
+      </div>
+      <div class="btn-row">
         <button type="button" class="btn-gray" onclick="sendTest('upcoming')">&#9197; Next Match Screen</button>
-      </div>
-      <div class="btn-row">
         <button type="button" class="btn-gray" onclick="sendTest('match')">&#9876; Active Match HUD</button>
+      </div>
+      <div class="btn-row">
         <button type="button" class="btn-gray" onclick="sendTest('idle')">&#9749; Standby Screen</button>
-      </div>
-      <div class="btn-row">
         <button type="button" class="btn-gray" onclick="sendTest('boot')">&#128640; Boot Screen</button>
-        <button type="button" class="btn-gray" onclick="sendTest('ap')">&#128246; AP Setup Screen</button>
       </div>
       <div class="btn-row">
+        <button type="button" class="btn-gray" onclick="sendTest('ap')">&#128246; AP Setup Screen</button>
         <button type="button" class="btn-gray" onclick="sendTest('error')">&#9888; Error Screen</button>
+      </div>
+      <div class="btn-row">
         <button type="button" class="btn-green" onclick="sendTest('resume')">&#10004; Resume Normal</button>
       </div>
     </div>
@@ -817,7 +1058,25 @@ String WiFiPortal::_getHTMLPage() {
     </div>
 
     <button type="button" class="btn-yellow" id="btn_save_config" onclick="saveSettings()">Save &amp; Reboot</button>
-    <button type="button" class="btn-gray" style="margin-top:10px;" onclick="resetDefaults()">Reset to Defaults</button>
+    <button type="button" class="btn-gray" style="margin-top:10px;margin-bottom:14px;" onclick="resetDefaults()">Reset to Defaults</button>
+
+    <div class="card">
+      <div class="card-title">
+        <span>Firmware Update (OTA)</span>
+        <span id="ota_ver_label" style="font-size:11px;color:var(--dim);">v1.3.1</span>
+      </div>
+      <p style="font-size:12px;color:var(--dim);margin-bottom:10px;">
+        Select a compiled <code>.bin</code> firmware image to flash over Wi-Fi. All Wi-Fi and Arena settings are preserved.
+      </p>
+      <input type="file" id="ota_file" accept=".bin" style="width:100%;padding:8px;background:#0c0e17;border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:12px;margin-bottom:10px;">
+      <div id="ota_progress_wrap" style="display:none;margin-bottom:10px;">
+        <div style="background:#090a10;border:1px solid var(--border);border-radius:6px;height:14px;overflow:hidden;margin-bottom:6px;">
+          <div id="ota_progress_bar" style="background:var(--gold);width:0%;height:100%;transition:width 0.15s;"></div>
+        </div>
+        <div id="ota_status_text" style="font-size:12px;color:var(--gold);text-align:center;font-weight:700;">Uploading: 0%</div>
+      </div>
+      <button type="button" class="btn-green" id="btn_ota_upload" onclick="uploadOTA()">&#11014; Upload &amp; Flash Firmware</button>
+    </div>
   </div>
 </div>
 
@@ -843,6 +1102,12 @@ window.onload = function() {
 
 function fetchInitialStatus() {
   fetch('/api/status').then(r => r.json()).then(data => {
+    if (data.version) {
+      const vb = document.getElementById('fw_version_badge');
+      const ov = document.getElementById('ota_ver_label');
+      if (vb) vb.innerText = 'v' + data.version;
+      if (ov) ov.innerText = 'Current: v' + data.version;
+    }
     if (data.configured_ssid) document.getElementById('wifi_ssid').value = data.configured_ssid;
     if (data.api_key) document.getElementById('api_key').value = data.api_key;
     if (data.api_url) {
@@ -950,20 +1215,59 @@ function pollControlStatus() {
     clockEl.className = 'clock-time';
     statusEl.className = 'clock-status';
 
-    if (data.is_ko) {
+    // 3-Tier Readiness Checkboxes
+    const chkRP = document.getElementById('chk_red_pit');
+    const chkRG = document.getElementById('chk_red_gate');
+    const chkRR = document.getElementById('chk_red_ready');
+    const chkBP = document.getElementById('chk_blue_pit');
+    const chkBG = document.getElementById('chk_blue_gate');
+    const chkBR = document.getElementById('chk_blue_ready');
+    if (chkRP) chkRP.checked = !!data.red_pit_ready;
+    if (chkRG) chkRG.checked = !!data.red_checked_in;
+    if (chkRR) chkRR.checked = !!data.red_match_ready;
+    if (chkBP) chkBP.checked = !!data.blue_pit_ready;
+    if (chkBG) chkBG.checked = !!data.blue_checked_in;
+    if (chkBR) chkBR.checked = !!data.blue_match_ready;
+
+    if (data.hazards_seconds) {
+      const hInput = document.getElementById('input_hazards_sec');
+      if (hInput && document.activeElement !== hInput) hInput.value = data.hazards_seconds;
+    }
+
+    if (data.clock_state === 'count_in') {
+      const cSec = data.count_in_seconds;
+      clockEl.innerText = (cSec > 0) ? cSec : 'FIGHT!';
+      clockEl.classList.add('clock-orange');
+      statusEl.innerText = 'COUNTDOWN IN PROGRESS';
+      statusEl.classList.add('clock-orange');
+    } else if (data.outcome_type === 'ko' || data.is_ko) {
       clockEl.innerText = 'K.O.!';
-      clockEl.classList.add(data.ko_winner === 'red' ? 'clock-red' : 'clock-blue');
-      statusEl.innerText = `${data.ko_winner.toUpperCase()} WINS BY KNOCKOUT`;
-      statusEl.classList.add(data.ko_winner === 'red' ? 'clock-red' : 'clock-blue');
+      const wCorner = (data.winner_corner || data.ko_winner || 'red');
+      clockEl.classList.add(wCorner === 'red' ? 'clock-red' : 'clock-blue');
+      statusEl.innerText = `${wCorner.toUpperCase()} WINS BY KNOCKOUT`;
+      statusEl.classList.add(wCorner === 'red' ? 'clock-red' : 'clock-blue');
+    } else if (data.outcome_type && data.outcome_type.length > 0) {
+      clockEl.innerText = data.outcome_type.toUpperCase();
+      const wCorner = data.winner_corner || 'tied';
+      clockEl.classList.add(wCorner === 'red' ? 'clock-red' : (wCorner === 'blue' ? 'clock-blue' : 'clock-orange'));
+      statusEl.innerText = (wCorner === 'tied') ? 'MATCH TIED (DRAW)' : `${wCorner.toUpperCase()} WINS (${data.outcome_type.toUpperCase()})`;
+      statusEl.classList.add(wCorner === 'red' ? 'clock-red' : (wCorner === 'blue' ? 'clock-blue' : 'clock-orange'));
+    } else if (data.match_status === 'Finished') {
+      clockEl.innerText = timeStr;
+      clockEl.classList.add('clock-orange');
+      statusEl.innerText = 'COMBAT FINISHED - SCORING BOUT';
+      statusEl.classList.add('clock-orange');
     } else if (data.clock_state === 'running') {
-      statusEl.innerText = 'CLOCK RUNNING';
+      statusEl.innerText = data.is_hazards_active ? '! HAZARDS ACTIVE !' : 'CLOCK RUNNING';
       if (rem <= 10) { clockEl.classList.add('clock-red'); statusEl.classList.add('clock-red'); }
-      else if (rem <= 30) { clockEl.classList.add('clock-orange'); statusEl.classList.add('clock-orange'); }
+      else if (rem <= 30 || data.is_hazards_active) { clockEl.classList.add('clock-orange'); statusEl.classList.add('clock-orange'); }
       else { clockEl.classList.add('clock-green'); statusEl.classList.add('clock-green'); }
     } else if (data.clock_state === 'paused') {
-      const reason = (data.clock_pause_reason && data.clock_pause_reason.length > 0)
-        ? ('PAUSED: ' + data.clock_pause_reason.replace(/_/g, ' ').toUpperCase())
-        : 'CLOCK PAUSED';
+      const reason = (data.pause_reason && data.pause_reason.length > 0)
+        ? ('PAUSED: ' + data.pause_reason.replace(/_/g, ' ').toUpperCase())
+        : (data.clock_pause_reason && data.clock_pause_reason.length > 0
+          ? ('PAUSED: ' + data.clock_pause_reason.replace(/_/g, ' ').toUpperCase())
+          : 'CLOCK PAUSED');
       statusEl.innerText = reason;
       clockEl.classList.add('clock-paused');
       statusEl.classList.add('clock-paused');
@@ -979,11 +1283,28 @@ function pollControlStatus() {
   }).catch(() => {});
 }
 
-function sendTimer(action) {
+function sendTimer(action, countIn) {
+  const reason = document.getElementById('pause_reason_sel').value;
   fetch('/api/control/timer', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: action })
+    body: JSON.stringify({ action: action, count_in: !!countIn, reason: reason })
+  }).then(r => r.json()).then(() => pollControlStatus());
+}
+
+function sendReadiness(corner, tier, val) {
+  fetch('/api/control/ready', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ corner: corner, tier: tier, value: val })
+  }).then(r => r.json()).then(() => pollControlStatus());
+}
+
+function sendResult(action, corner, outcome) {
+  fetch('/api/control/result', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: action, corner: corner, outcome: outcome })
   }).then(r => r.json()).then(() => pollControlStatus());
 }
 
@@ -996,11 +1317,7 @@ function setDuration(secs) {
 }
 
 function sendKO(corner) {
-  fetch('/api/control/ko', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ corner: corner })
-  }).then(r => r.json()).then(() => pollControlStatus());
+  sendResult('record', corner, 'ko');
 }
 
 function setMode(mode) {
@@ -1033,6 +1350,12 @@ function saveMatchDetails() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   }).then(r => r.json()).then(() => {
+    const hSec = parseFloat(document.getElementById('input_hazards_sec').value) || 60;
+    fetch('/api/control/timer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'set_hazards', hazards_seconds: hSec })
+    });
     showToast('Match details updated!', false);
     pollControlStatus();
   });
@@ -1145,8 +1468,85 @@ function resetDefaults() {
     });
   }
 }
+
+function uploadOTA() {
+  const fileInput = document.getElementById('ota_file');
+  if (!fileInput.files || fileInput.files.length === 0) {
+    showToast('Please select a .bin firmware file first', true);
+    return;
+  }
+  const file = fileInput.files[0];
+  if (!file.name.endsWith('.bin')) {
+    showToast('Invalid file type: please select a .bin file', true);
+    return;
+  }
+
+  const btn = document.getElementById('btn_ota_upload');
+  const wrap = document.getElementById('ota_progress_wrap');
+  const bar = document.getElementById('ota_progress_bar');
+  const statusTxt = document.getElementById('ota_status_text');
+
+  btn.disabled = true;
+  btn.innerText = 'Flashing Firmware...';
+  wrap.style.display = 'block';
+  bar.style.width = '0%';
+  statusTxt.innerText = 'Uploading: 0%';
+
+  const formData = new FormData();
+  formData.append('firmware', file, file.name);
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/ota?size=' + file.size, true);
+
+  xhr.upload.onprogress = function(e) {
+    if (e.lengthComputable) {
+      const pct = Math.round((e.loaded / e.total) * 100);
+      bar.style.width = pct + '%';
+      statusTxt.innerText = (pct < 100) ? ('Uploading & Flashing: ' + pct + '%') : 'Verifying Flash & Rebooting...';
+    }
+  };
+
+  xhr.onload = function() {
+    if (xhr.status === 200) {
+      bar.style.width = '100%';
+      bar.style.background = 'var(--green)';
+      statusTxt.innerText = 'Update Complete! Waiting for device reboot...';
+      showToast('Firmware updated! Device is rebooting...', false);
+      setTimeout(() => {
+        const waitTimer = setInterval(() => {
+          fetch('/api/status').then(r => r.json()).then(d => {
+            if (d && d.version) {
+              clearInterval(waitTimer);
+              window.location.reload();
+            }
+          }).catch(() => {});
+        }, 1500);
+      }, 3000);
+    } else {
+      let msg = 'Firmware update failed';
+      try { msg = JSON.parse(xhr.responseText).message || msg; } catch(e) {}
+      statusTxt.innerText = msg;
+      showToast(msg, true);
+      btn.disabled = false;
+      btn.innerText = '⬆ Upload & Flash Firmware';
+    }
+  };
+
+  xhr.onerror = function() {
+    statusTxt.innerText = 'Upload failed (connection lost)';
+    showToast('Network error during firmware upload', true);
+    btn.disabled = false;
+    btn.innerText = '⬆ Upload & Flash Firmware';
+  };
+
+  xhr.send(formData);
+}
 </script>
 </body>
 </html>
 )rawhtml";
+
+void WiFiPortal::_handleRoot() {
+    _server.send_P(200, "text/html", PAGE_HTML);
 }
+

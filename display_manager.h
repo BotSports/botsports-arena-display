@@ -14,9 +14,13 @@ enum DisplayScreen {
     SCREEN_IDLE_EVENT,
     SCREEN_UPCOMING_MATCH,
     SCREEN_ACTIVE_MATCH,
+    SCREEN_COUNT_IN,
+    SCREEN_FINISHED,
     SCREEN_KO,
+    SCREEN_DECISION,
     SCREEN_SCROLLING_IP
 };
+
 
 class DisplayManager {
 public:
@@ -29,6 +33,7 @@ public:
 
     void showBoot();
     void showConnecting(const String& ssid, int progress);
+    void showOTAProgress(const String& status, int progress);
     void showAPMode(const String& apSSID, const String& ip);
     void showError(const String& title, const String& subtitle);
 
@@ -52,6 +57,8 @@ private:
     int _marqueeOffsetBanner;
     int _marqueeOffsetAP;
     int _marqueeOffsetIdle;
+    int _marqueeOffsetFinished;
+    int _marqueeOffsetDecision;
     bool _flashState;
     unsigned long _lastFlashTime;
 
@@ -80,13 +87,17 @@ private:
     void _renderActiveMatch();
     void _renderUpcomingMatch();
     void _renderIdleEvent();
+    void _renderCountIn();
+    void _renderFinished();
     void _renderKO();
+    void _renderDecision();
     void _renderAPMode();
     void _renderIPScroll();
     void _drawBigClock(int x, int y, int minutes, int seconds, uint16_t color);
     void _drawBigDigit(int x, int y, int digit, uint16_t color);
     void _drawBigColon(int x, int y, uint16_t color);
-    void _drawScrollingText(int startX, int y, const String& text, uint16_t color, int& offset, int maxW = PANEL_RES_X, uint16_t maskBg = 0);
+    void _drawScrollingText(int startX, int y, const String& text, uint16_t color, int& offset, int maxW = PANEL_RES_X, uint16_t maskBg = 0, int clipLeft = -1, int clipRight = -1);
 };
+
 
 extern DisplayManager displayMgr;

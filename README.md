@@ -80,7 +80,7 @@ Firmware for an in/on-arena combat robotics display driven by the [BotSports API
 
 ## Wiring Diagram (StampS3 to HUB75)
 
-Standard 16-pin HUB75 IDC header pinout mapping to M5Stack StampS3 GPIO pins (defined in [`config.h`](file:///home/pmumby/Development/Personal/botsports-arena-display/config.h)):
+Standard 16-pin HUB75 IDC header pinout mapping to M5Stack StampS3 GPIO pins (defined in [`config.h`](./config.h)):
 
 ```
           HUB75 16-Pin Connector
@@ -128,7 +128,19 @@ You can open the web interface from any smartphone, tablet, or laptop on the sam
 
 ## Building & Flashing
 
-### Option A: Using `arduino-cli`
+### Option A: Using `./build.sh` (Recommended)
+
+The `build.sh` script compiles the sketch, extracts `FIRMWARE_VERSION` from [`config.h`](./config.h), and exports versioned `.bin` files ready for Web Control Panel OTA updates or USB flashing:
+
+```bash
+# 1. Build versioned OTA binary (outputs dist/botsports-arena-display-v<VERSION>.bin)
+./build.sh
+
+# 2. Build and immediately flash to a USB-connected StampS3
+./build.sh --upload /dev/ttyACM1
+```
+
+### Option B: Manual `arduino-cli`
 
 ```bash
 # 1. Install board support (if not already installed)
@@ -138,10 +150,10 @@ arduino-cli core install esp32:esp32
 arduino-cli lib install "ESP32 HUB75 LED MATRIX PANEL DMA Display" "Adafruit GFX Library" "ArduinoJson"
 
 # 3. Compile sketch
-arduino-cli compile -b esp32:esp32:m5stack_stamp_s3 .
+arduino-cli compile -b esp32:esp32:m5stack_stamp_s3 --export-binaries .
 
-# 4. Upload to device (specify serial port, e.g. /dev/ttyACM0)
-arduino-cli upload -b esp32:esp32:m5stack_stamp_s3 -p /dev/ttyACM0 .
+# 4. Upload to device (specify serial port, e.g. /dev/ttyACM1)
+arduino-cli upload -b esp32:esp32:m5stack_stamp_s3 -p /dev/ttyACM1 .
 ```
 
 ### Option B: Using PlatformIO

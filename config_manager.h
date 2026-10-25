@@ -19,7 +19,12 @@ struct AppSettings {
 
     // Persisted Operating Mode
     uint8_t op_mode;     // 0 = OPMODE_API, 1 = OPMODE_STANDALONE
+
+    // Tournament Scoping & Hazard Configuration
+    int tournament_id;   // 0 = auto-resolve, >0 = scoped to specific tournament
+    float hazards_seconds; // countdown mark for hazards activation (default 60s)
 };
+
 
 class ConfigManager {
 public:

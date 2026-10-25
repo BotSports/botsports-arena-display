@@ -32,6 +32,8 @@ DisplayManager::DisplayManager() {
     _marqueeOffsetBanner = 0;
     _marqueeOffsetAP = 0;
     _marqueeOffsetIdle = 0;
+    _marqueeOffsetFinished = 0;
+    _marqueeOffsetDecision = 0;
     _flashState = false;
     _lastFlashTime = 0;
 
@@ -150,6 +152,11 @@ void DisplayManager::update() {
         _marqueeOffsetBlue++;
         _marqueeOffsetUpcoming++;
         _marqueeOffsetKO++;
+        _marqueeOffsetBanner++;
+        _marqueeOffsetAP++;
+        _marqueeOffsetIdle++;
+        _marqueeOffsetFinished++;
+        _marqueeOffsetDecision++;
     }
 
     // Toggle flash state every 500ms
@@ -171,17 +178,26 @@ void DisplayManager::update() {
         case SCREEN_AP_MODE:
             _renderAPMode();
             break;
+        case SCREEN_COUNT_IN:
+            _renderCountIn();
+            break;
         case SCREEN_ACTIVE_MATCH:
             _renderActiveMatch();
+            break;
+        case SCREEN_FINISHED:
+            _renderFinished();
+            break;
+        case SCREEN_KO:
+            _renderKO();
+            break;
+        case SCREEN_DECISION:
+            _renderDecision();
             break;
         case SCREEN_UPCOMING_MATCH:
             _renderUpcomingMatch();
             break;
         case SCREEN_IDLE_EVENT:
             _renderIdleEvent();
-            break;
-        case SCREEN_KO:
-            _renderKO();
             break;
         default:
             break;
@@ -281,6 +297,32 @@ void DisplayManager::showConnecting(const String& ssid, int progress) {
     _dmaDisplay->flipDMABuffer();
 }
 
+void DisplayManager::showOTAProgress(const String& status, int progress) {
+    if (!_dmaDisplay) return;
+    _dmaDisplay->fillScreen(_colorBlack);
+
+    _dmaDisplay->fillRect(0, 0, PANEL_RES_X, 9, _colorYellow);
+    _dmaDisplay->setTextWrap(false);
+    _dmaDisplay->setTextSize(1);
+    _dmaDisplay->setTextColor(_colorBlack);
+    _dmaDisplay->setCursor(5, 1);
+    _dmaDisplay->print("OTA FIRMWARE");
+
+    _dmaDisplay->setTextColor(_colorCyan);
+    _dmaDisplay->setCursor(2, 15);
+    String truncStatus = status.length() > 13 ? status.substring(0, 13) : status;
+    _dmaDisplay->print(truncStatus);
+
+    int barW = 76;
+    int clamped = constrain(progress, 0, 100);
+    int fillW = ((barW - 2) * clamped) / 100;
+    _dmaDisplay->drawRect(2, 28, barW, 8, _colorBrightGray);
+    if (fillW > 0) {
+        _dmaDisplay->fillRect(3, 29, fillW, 6, _colorGreen);
+    }
+    _dmaDisplay->flipDMABuffer();
+}
+
 void DisplayManager::showAPMode(const String& apSSID, const String& ip) {
     _apSSID = apSSID;
     _apIP = ip;
@@ -338,26 +380,42 @@ void DisplayManager::_renderActiveMatch() {
     String redName = matchCtrl.getCurrentRedName();
     String blueName = matchCtrl.getCurrentBlueName();
     ClockState cState = matchCtrl.getCurrentClockState();
+    bool hazardsActive = matchCtrl.isCurrentHazardsActive();
+    String pauseReason = matchCtrl.getCurrentPauseReason();
 
-    // 1. Top Header Bar: Round & Match number (Round first: R1 M1) + Arena Name (right)
+    // 1. Top Header Bar: Round & Match number or Alert
     _dmaDisplay->setTextSize(1);
-    _dmaDisplay->setTextColor(_colorYellow);
-    _dmaDisplay->setCursor(1, 1);
-    _dmaDisplay->printf("R%d M%d", rNum, mNum);
 
-    String pauseReason = apiClient.getData().clock_pause_reason;
     if (cState == CLOCK_PAUSED && pauseReason.length() > 0) {
         String label = pauseReason;
         label.replace('_', ' ');
         label.toUpperCase();
-        _drawScrollingText(38, 1, "PAUSE: " + label, _colorYellow, _marqueeOffsetBanner, PANEL_RES_X - 38, _colorBlack);
+        _dmaDisplay->fillRect(0, 0, PANEL_RES_X, 9, _colorYellow);
+        _drawScrollingText(0, 1, "PAUSED: " + label, _colorBlack, _marqueeOffsetBanner, PANEL_RES_X, _colorYellow);
+    } else if (hazardsActive && cState == CLOCK_RUNNING) {
+        if (_flashState) {
+            _dmaDisplay->fillRect(0, 0, PANEL_RES_X, 9, _colorRed);
+            _dmaDisplay->setTextSize(1);
+            _dmaDisplay->setTextColor(_colorWhite);
+            _dmaDisplay->setCursor(1, 1);
+            _dmaDisplay->print("!! HAZARDS !!");
+        } else {
+            _dmaDisplay->setTextColor(_colorYellow);
+            _dmaDisplay->setCursor(1, 1);
+            _dmaDisplay->printf("R%d M%d", rNum, mNum);
+
+            _dmaDisplay->setTextColor(_colorOrange);
+            _dmaDisplay->setCursor(44, 1);
+            _dmaDisplay->print("HAZARD");
+        }
     } else {
         String headerRight = (matchCtrl.getMode() == OPMODE_STANDALONE) ? "LOCAL" : apiClient.getData().arena_name;
         if (headerRight.length() == 0) headerRight = "ARENA";
-        if (headerRight.length() > 6) headerRight = headerRight.substring(0, 6);
-        _dmaDisplay->setTextColor(_colorWhite);
-        _dmaDisplay->setCursor(44, 1);
-        _dmaDisplay->print(headerRight);
+        _drawScrollingText(36, 1, headerRight, _colorWhite, _marqueeOffsetBanner, PANEL_RES_X - 36, _colorBlack);
+
+        _dmaDisplay->setTextColor(_colorYellow);
+        _dmaDisplay->setCursor(1, 1);
+        _dmaDisplay->printf("R%d M%d", rNum, mNum);
     }
 
     _dmaDisplay->drawFastHLine(0, 9, PANEL_RES_X, _colorDarkGray);
@@ -377,6 +435,8 @@ void DisplayManager::_renderActiveMatch() {
             clockColor = _flashState ? _colorRed : _colorWhite;
         } else if (remSec <= 30.0f) {
             clockColor = _colorOrange;
+        } else if (hazardsActive) {
+            clockColor = _flashState ? _colorYellow : _colorGreen;
         }
     } else {
         clockColor = _colorCyan; // Stopped
@@ -391,29 +451,55 @@ void DisplayManager::_renderActiveMatch() {
         _drawBigClock(23, 11, minutes, seconds, clockColor);
     }
 
-    // 3. Bottom Rows: Combatant bot names (respects local Corner configuration!)
+    // 3. Bottom Rows: Combatant bot names + 3-tier readiness dots [Pit (Amber), Gate (Cyan), Match (Green)]
+    bool rPit, rGate, rMatch, bPit, bGate, bMatch;
+    if (matchCtrl.getMode() == OPMODE_STANDALONE || matchCtrl.getMode() == OPMODE_TEST) {
+        rPit = matchCtrl.getCurrentRedPitReady();
+        rGate = matchCtrl.getCurrentRedCheckedIn();
+        rMatch = matchCtrl.getCurrentRedMatchReady();
+        bPit = matchCtrl.getCurrentBluePitReady();
+        bGate = matchCtrl.getCurrentBlueCheckedIn();
+        bMatch = matchCtrl.getCurrentBlueMatchReady();
+    } else {
+        apiClient.getReadiness(rPit, rGate, rMatch, bPit, bGate, bMatch);
+    }
+
     String myCorner = configMgr.settings.corner;
     if (myCorner == "red") {
         // Red Corner Display Unit: emphasize Red Fighter
         _dmaDisplay->fillRect(0, 26, PANEL_RES_X, 14, _dmaDisplay->color565(50, 5, 5));
-        _drawScrollingText(7, 26, "RED: " + redName, _colorWhite, _marqueeOffsetRed, PANEL_RES_X - 7, _dmaDisplay->color565(50, 5, 5));
-        _dmaDisplay->fillRect(1, 28, 4, 4, _colorRed); // re-assert indicator
+        _drawScrollingText(15, 26, "RED: " + redName, _colorWhite, _marqueeOffsetRed, PANEL_RES_X - 15, _dmaDisplay->color565(50, 5, 5));
+        _dmaDisplay->fillRect(1, 28, 3, 4, _colorRed);
+        _dmaDisplay->fillRect(5, 29, 2, 2, rPit ? _colorOrange : _colorDarkGray);
+        _dmaDisplay->fillRect(8, 29, 2, 2, rGate ? _colorCyan : _colorDarkGray);
+        _dmaDisplay->fillRect(11, 29, 2, 2, rMatch ? _colorGreen : _colorDarkGray);
 
         _drawScrollingText(7, 33, "vs " + blueName, _colorBrightGray, _marqueeOffsetBlue, PANEL_RES_X - 7, _dmaDisplay->color565(50, 5, 5));
+        _dmaDisplay->fillRect(1, 35, 3, 3, _colorBlue);
     } else if (myCorner == "blue") {
         // Blue Corner Display Unit: emphasize Blue Fighter
         _dmaDisplay->fillRect(0, 26, PANEL_RES_X, 14, _dmaDisplay->color565(5, 15, 50));
-        _drawScrollingText(7, 26, "BLU: " + blueName, _colorWhite, _marqueeOffsetBlue, PANEL_RES_X - 7, _dmaDisplay->color565(5, 15, 50));
-        _dmaDisplay->fillRect(1, 28, 4, 4, _colorBlue); // re-assert indicator
+        _drawScrollingText(15, 26, "BLU: " + blueName, _colorWhite, _marqueeOffsetBlue, PANEL_RES_X - 15, _dmaDisplay->color565(5, 15, 50));
+        _dmaDisplay->fillRect(1, 28, 3, 4, _colorBlue);
+        _dmaDisplay->fillRect(5, 29, 2, 2, bPit ? _colorOrange : _colorDarkGray);
+        _dmaDisplay->fillRect(8, 29, 2, 2, bGate ? _colorCyan : _colorDarkGray);
+        _dmaDisplay->fillRect(11, 29, 2, 2, bMatch ? _colorGreen : _colorDarkGray);
 
         _drawScrollingText(7, 33, "vs " + redName, _colorBrightGray, _marqueeOffsetRed, PANEL_RES_X - 7, _dmaDisplay->color565(5, 15, 50));
+        _dmaDisplay->fillRect(1, 35, 3, 3, _colorRed);
     } else {
-        // Standard Dual Arena Display: both names scroll horizontally if long!
-        _drawScrollingText(7, 26, redName, _colorWhite, _marqueeOffsetRed, PANEL_RES_X - 7, _colorBlack);
-        _dmaDisplay->fillRect(1, 28, 4, 4, _colorRed);
+        // Standard Dual Arena Display: both names scroll horizontally with readiness dots
+        _drawScrollingText(15, 26, redName, _colorWhite, _marqueeOffsetRed, PANEL_RES_X - 15, _colorBlack);
+        _dmaDisplay->fillRect(1, 28, 3, 4, _colorRed);
+        _dmaDisplay->fillRect(5, 29, 2, 2, rPit ? _colorOrange : _colorDarkGray);
+        _dmaDisplay->fillRect(8, 29, 2, 2, rGate ? _colorCyan : _colorDarkGray);
+        _dmaDisplay->fillRect(11, 29, 2, 2, rMatch ? _colorGreen : _colorDarkGray);
 
-        _drawScrollingText(7, 33, blueName, _colorWhite, _marqueeOffsetBlue, PANEL_RES_X - 7, _colorBlack);
-        _dmaDisplay->fillRect(1, 35, 4, 4, _colorBlue);
+        _drawScrollingText(15, 33, blueName, _colorWhite, _marqueeOffsetBlue, PANEL_RES_X - 15, _colorBlack);
+        _dmaDisplay->fillRect(1, 35, 3, 4, _colorBlue);
+        _dmaDisplay->fillRect(5, 36, 2, 2, bPit ? _colorOrange : _colorDarkGray);
+        _dmaDisplay->fillRect(8, 36, 2, 2, bGate ? _colorCyan : _colorDarkGray);
+        _dmaDisplay->fillRect(11, 36, 2, 2, bMatch ? _colorGreen : _colorDarkGray);
     }
 }
 
@@ -553,6 +639,125 @@ void DisplayManager::_renderKO() {
     }
 }
 
+void DisplayManager::_renderCountIn() {
+    _dmaDisplay->fillScreen(_colorBlack);
+
+    int countSec = (matchCtrl.getMode() == OPMODE_STANDALONE) ? matchCtrl.getCurrentCountInSeconds() : apiClient.getInterpolatedCountInSeconds();
+
+    // Top Header: pulsing yellow countdown banner
+    _dmaDisplay->fillRect(0, 0, PANEL_RES_X, 8, _flashState ? _colorYellow : _dmaDisplay->color565(120, 100, 0));
+    _dmaDisplay->setTextSize(1);
+    _dmaDisplay->setTextColor(_colorBlack);
+    _dmaDisplay->setCursor(14, 1);
+    _dmaDisplay->print("COUNTDOWN");
+
+    if (countSec > 0) {
+        // Big 3, 2, 1
+        _dmaDisplay->setTextSize(3);
+        _dmaDisplay->setTextColor(_colorYellow);
+        _dmaDisplay->setCursor(32, 11);
+        _dmaDisplay->print(countSec);
+    } else {
+        // FIGHT!
+        _dmaDisplay->setTextSize(2);
+        _dmaDisplay->setTextColor(_colorGreen);
+        _dmaDisplay->setCursor(5, 12);
+        _dmaDisplay->print("FIGHT!");
+    }
+
+    // Bottom combatants line: 25px Red slot (x=5..29), 4px buffer, "vs" at x=34..44, 4px buffer, 26px Blue slot (x=49..74)
+    String rName = matchCtrl.getCurrentRedName();
+    String bName = matchCtrl.getCurrentBlueName();
+
+    _drawScrollingText(5, 32, rName, _colorWhite, _marqueeOffsetRed, 25, _colorBlack, 5, 5);
+    _drawScrollingText(49, 32, bName, _colorWhite, _marqueeOffsetBlue, 26, _colorBlack, 5, 5);
+
+    // Red indicator box (x=1..3)
+    _dmaDisplay->fillRect(1, 34, 3, 4, _colorRed);
+    // Blue indicator box (x=76..78)
+    _dmaDisplay->fillRect(PANEL_RES_X - 4, 34, 3, 4, _colorBlue);
+
+    // Center "vs" with buffer
+    _dmaDisplay->setTextColor(_colorBrightGray);
+    _dmaDisplay->setCursor(35, 32);
+    _dmaDisplay->print("vs");
+}
+
+void DisplayManager::_renderFinished() {
+    _dmaDisplay->fillScreen(_colorBlack);
+
+    // Top banner: Orange bar with black text
+    _dmaDisplay->fillRect(0, 0, PANEL_RES_X, 9, _colorOrange);
+    _dmaDisplay->setTextSize(1);
+    _dmaDisplay->setTextColor(_colorBlack);
+    _dmaDisplay->setCursor(4, 1);
+    _dmaDisplay->print("COMBAT FINISHED");
+
+    // Middle: Flashing Awaiting Decision / Scoring
+    if (_flashState) {
+        _dmaDisplay->setTextColor(_colorYellow);
+        _dmaDisplay->setCursor(2, 13);
+        _dmaDisplay->print("AWAITING DECISION");
+    } else {
+        _dmaDisplay->setTextColor(_colorBrightGray);
+        _dmaDisplay->setCursor(11, 13);
+        _dmaDisplay->print("SCORING BOUT");
+    }
+
+    // Bottom: Fighters
+    _dmaDisplay->fillRect(1, 25, 3, 4, _colorRed);
+    _drawScrollingText(6, 24, matchCtrl.getCurrentRedName(), _colorWhite, _marqueeOffsetRed, PANEL_RES_X - 6, _colorBlack);
+
+    _dmaDisplay->fillRect(1, 33, 3, 4, _colorBlue);
+    _drawScrollingText(6, 32, matchCtrl.getCurrentBlueName(), _colorWhite, _marqueeOffsetBlue, PANEL_RES_X - 6, _colorBlack);
+}
+
+void DisplayManager::_renderDecision() {
+    _dmaDisplay->fillScreen(_colorBlack);
+
+    String winnerCorner = matchCtrl.getCurrentWinnerCorner();
+    String winnerName = matchCtrl.getCurrentWinnerName();
+    String outcomeType = matchCtrl.getCurrentOutcomeType();
+    outcomeType.toUpperCase();
+
+    if (winnerCorner == "tied" || winnerCorner == "draw" || outcomeType == "DRAW") {
+        _dmaDisplay->fillRect(0, 0, PANEL_RES_X, 9, _colorYellow);
+        _dmaDisplay->setTextSize(1);
+        _dmaDisplay->setTextColor(_colorBlack);
+        _dmaDisplay->setCursor(8, 1);
+        _dmaDisplay->print("MATCH TIED - DRAW");
+
+        _dmaDisplay->setTextColor(_colorWhite);
+        _dmaDisplay->setCursor(2, 14);
+        _dmaDisplay->print("JUDGES SPLIT");
+
+        _drawScrollingText(2, 26, matchCtrl.getCurrentRedName() + " tied " + matchCtrl.getCurrentBlueName(), _colorBrightGray, _marqueeOffsetDecision, PANEL_RES_X - 4, _colorBlack);
+        return;
+    }
+
+    uint16_t cornerColor = (winnerCorner == "red") ? _colorRed : _colorBlue;
+    String bannerText = (winnerCorner == "red") ? "RED WINS" : "BLUE WINS";
+    if (outcomeType.length() > 0) {
+        bannerText += " - " + outcomeType;
+    } else {
+        bannerText += " - DECISION";
+    }
+
+    // Top banner with winner corner color
+    _dmaDisplay->fillRect(0, 0, PANEL_RES_X, 9, cornerColor);
+    _drawScrollingText(0, 1, bannerText, _colorBlack, _marqueeOffsetBanner, PANEL_RES_X, cornerColor);
+
+    _dmaDisplay->setTextSize(1);
+    _dmaDisplay->setTextColor(_colorYellow);
+    _dmaDisplay->setCursor(2, 12);
+    _dmaDisplay->print("WINNER:");
+
+    _drawScrollingText(7, 21, winnerName, _colorWhite, _marqueeOffsetDecision, PANEL_RES_X - 7, _colorBlack);
+    _dmaDisplay->fillRect(1, 23, 4, 4, cornerColor);
+
+    _drawScrollingText(2, 31, "JUDGES DECISION", _colorCyan, _marqueeOffsetBanner, PANEL_RES_X - 4, _colorBlack);
+}
+
 void DisplayManager::_drawBigClock(int x, int y, int minutes, int seconds, uint16_t color) {
     int m = constrain(minutes, 0, 9);
     int s10 = (seconds / 10) % 10;
@@ -583,7 +788,7 @@ void DisplayManager::_drawBigDigit(int x, int y, int digit, uint16_t color) {
     if (seg & 0b01000000) _dmaDisplay->fillRect(x + 1, y + 6, 6, 2, color);     // g
 }
 
-void DisplayManager::_drawScrollingText(int startX, int y, const String& text, uint16_t color, int& offset, int maxW, uint16_t maskBg) {
+void DisplayManager::_drawScrollingText(int startX, int y, const String& text, uint16_t color, int& offset, int maxW, uint16_t maskBg, int clipLeft, int clipRight) {
     if (!_dmaDisplay) return;
 
     int textW = text.length() * 6;
@@ -592,28 +797,44 @@ void DisplayManager::_drawScrollingText(int startX, int y, const String& text, u
     _dmaDisplay->setTextColor(color);
 
     if (textW <= maxW) {
+        _dmaDisplay->setTextWrap(false);
+        _dmaDisplay->setTextSize(1);
+        _dmaDisplay->setTextColor(color);
         _dmaDisplay->setCursor(startX, y);
         _dmaDisplay->print(text);
         offset = 0;
     } else {
-        int totalScrollWidth = textW + 20;
+        int totalScrollWidth = textW + 16;
         int curX = startX - (offset % totalScrollWidth);
 
-        _dmaDisplay->setCursor(curX, y);
-        _dmaDisplay->print(text);
+        // Windowed character drawing: only draw characters that intersect [startX - 5, startX + maxW)
+        auto drawWindowed = [&](int baseOffset) {
+            for (size_t i = 0; i < text.length(); i++) {
+                int chX = baseOffset + (int)i * 6;
+                if (chX + 5 >= startX && chX < startX + maxW) {
+                    _dmaDisplay->drawChar(chX, y, text[i], color, maskBg, 1);
+                }
+            }
+        };
 
+        drawWindowed(curX);
         if (curX + totalScrollWidth < startX + maxW) {
-            _dmaDisplay->setCursor(curX + totalScrollWidth, y);
-            _dmaDisplay->print(text);
+            drawWindowed(curX + totalScrollWidth);
         }
 
-        // Cleanly clip text that scrolled before startX
-        if (startX > 0) {
-            _dmaDisplay->fillRect(0, y, startX, 8, maskBg);
+        // Cleanly clip partial character pixels on the left
+        int leftW = (clipLeft >= 0) ? clipLeft : startX;
+        if (leftW > 0 && startX > 0) {
+            int clipX = startX - leftW;
+            if (clipX < 0) clipX = 0;
+            _dmaDisplay->fillRect(clipX, y, leftW, 8, maskBg);
         }
-        // Cleanly clip text that scrolled past startX + maxW
-        if (startX + maxW < PANEL_RES_X) {
-            _dmaDisplay->fillRect(startX + maxW, y, PANEL_RES_X - (startX + maxW), 8, maskBg);
+
+        // Cleanly clip partial character pixels on the right
+        int rightW = (clipRight >= 0) ? clipRight : (PANEL_RES_X - (startX + maxW));
+        if (rightW > 0 && startX + maxW < PANEL_RES_X) {
+            if (startX + maxW + rightW > PANEL_RES_X) rightW = PANEL_RES_X - (startX + maxW);
+            _dmaDisplay->fillRect(startX + maxW, y, rightW, 8, maskBg);
         }
     }
 }

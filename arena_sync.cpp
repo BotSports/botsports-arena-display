@@ -96,26 +96,59 @@ void ArenaSyncManager::broadcastState(bool immediate) {
     memset(&pkt, 0, sizeof(pkt));
 
     pkt.magic = ARENA_SYNC_MAGIC;
-    pkt.version = 1;
+    pkt.version = 2;
     strncpy(pkt.sync_key, configMgr.settings.sync_key.c_str(), sizeof(pkt.sync_key) - 1);
     pkt.seq = _txSeq++;
     pkt.op_mode = (uint8_t)matchCtrl.getMode();
 
     // Match & Clock State
     pkt.clock_state = (uint8_t)matchCtrl.getCurrentClockState();
+    pkt.count_in_seconds = (int8_t)matchCtrl.getCurrentCountInSeconds();
     pkt.remaining_seconds = matchCtrl.getCurrentRemainingSeconds();
     pkt.duration_seconds = matchCtrl.getDuration();
+    pkt.hazards_seconds = matchCtrl.getHazardsThreshold();
+    pkt.is_hazards_active = matchCtrl.isCurrentHazardsActive() ? 1 : 0;
+
     pkt.match_number = (uint16_t)matchCtrl.getCurrentMatchNumber();
     pkt.round_number = (uint16_t)matchCtrl.getCurrentRoundNumber();
 
-    strncpy(pkt.red_name, matchCtrl.getCurrentRedName().c_str(), sizeof(pkt.red_name) - 1);
-    strncpy(pkt.blue_name, matchCtrl.getCurrentBlueName().c_str(), sizeof(pkt.blue_name) - 1);
+    String st = matchCtrl.getCurrentMatchStatus();
+    st.toLowerCase();
+    if (st == "ongoing") pkt.match_status = 1;
+    else if (st == "finished") pkt.match_status = 2;
+    else if (st == "decided" || st == "completed") pkt.match_status = 3;
+    else pkt.match_status = 0; // Scheduled
 
-    // KO state
-    pkt.is_ko = matchCtrl.isKO() ? 1 : 0;
-    pkt.ko_winner = (matchCtrl.getKOWinner() == "red") ? 1 : ((matchCtrl.getKOWinner() == "blue") ? 2 : 0);
-    strncpy(pkt.ko_winner_name, matchCtrl.getKOWinnerName().c_str(), sizeof(pkt.ko_winner_name) - 1);
-    pkt.ko_time = matchCtrl.getKOTime();
+    strncpy(pkt.red_name, matchCtrl.getCurrentRedName().c_str(), sizeof(pkt.red_name) - 1);
+    pkt.red_pit_ready = matchCtrl.getCurrentRedPitReady() ? 1 : 0;
+    pkt.red_checked_in = matchCtrl.getCurrentRedCheckedIn() ? 1 : 0;
+    pkt.red_match_ready = matchCtrl.getCurrentRedMatchReady() ? 1 : 0;
+
+    strncpy(pkt.blue_name, matchCtrl.getCurrentBlueName().c_str(), sizeof(pkt.blue_name) - 1);
+    pkt.blue_pit_ready = matchCtrl.getCurrentBluePitReady() ? 1 : 0;
+    pkt.blue_checked_in = matchCtrl.getCurrentBlueCheckedIn() ? 1 : 0;
+    pkt.blue_match_ready = matchCtrl.getCurrentBlueMatchReady() ? 1 : 0;
+
+    // Outcome & Decision state
+    String outcome = matchCtrl.getCurrentOutcomeType();
+    outcome.toLowerCase();
+    if (outcome == "ko") pkt.outcome_type = 1;
+    else if (outcome == "decision") pkt.outcome_type = 2;
+    else if (outcome == "forfeit" || outcome == "disqualified") pkt.outcome_type = 3;
+    else if (outcome == "tied") pkt.outcome_type = 4;
+    else pkt.outcome_type = 0;
+
+    pkt.is_ko = (pkt.outcome_type == 1) ? 1 : 0;
+
+    String winCorner = matchCtrl.getCurrentWinnerCorner();
+    winCorner.toLowerCase();
+    if (winCorner == "red") pkt.winner_corner = 1;
+    else if (winCorner == "blue") pkt.winner_corner = 2;
+    else if (winCorner == "tied") pkt.winner_corner = 3;
+    else pkt.winner_corner = 0;
+
+    strncpy(pkt.winner_name, matchCtrl.getCurrentWinnerName().c_str(), sizeof(pkt.winner_name) - 1);
+    pkt.outcome_time = matchCtrl.getCurrentOutcomeTime();
 
     // API Event & Arena Info
     const ArenaStatusData& apiData = apiClient.getData();
@@ -134,7 +167,7 @@ void ArenaSyncManager::broadcastState(bool immediate) {
     }
 
     pkt.screen_mode = (uint8_t)displayMgr.getScreen();
-    strncpy(pkt.pause_reason, apiData.clock_pause_reason.c_str(), sizeof(pkt.pause_reason) - 1);
+    strncpy(pkt.pause_reason, matchCtrl.getCurrentPauseReason().c_str(), sizeof(pkt.pause_reason) - 1);
 
     // Broadcast target
     IPAddress bcastIP = WiFi.broadcastIP();
@@ -175,7 +208,7 @@ void ArenaSyncManager::_processIncomingPacket(uint8_t* buf, size_t len, IPAddres
         ArenaSyncPacket pkt;
         memcpy(&pkt, buf, sizeof(pkt));
 
-        if (pkt.magic != ARENA_SYNC_MAGIC) return;
+        if (pkt.magic != ARENA_SYNC_MAGIC || pkt.version != 2) return;
         if (strncmp(pkt.sync_key, configMgr.settings.sync_key.c_str(), sizeof(pkt.sync_key)) != 0) {
             return; // Key mismatch (different arena)
         }
@@ -240,15 +273,19 @@ void ArenaSyncManager::_applySyncPacket(const ArenaSyncPacket& pkt) {
     // Update match info
     matchCtrl.setMatchDetails(pkt.match_number, pkt.round_number, String(pkt.red_name), String(pkt.blue_name));
 
-    // Update KO state
-    if (pkt.is_ko) {
-        if (!matchCtrl.isKO()) {
-            matchCtrl.triggerKO((pkt.ko_winner == 1) ? "red" : "blue");
-        }
+    // Update readiness
+    matchCtrl.setRedReadiness(pkt.red_pit_ready != 0, pkt.red_checked_in != 0, pkt.red_match_ready != 0);
+    matchCtrl.setBlueReadiness(pkt.blue_pit_ready != 0, pkt.blue_checked_in != 0, pkt.blue_match_ready != 0);
+
+    // Update Outcome & Decision state
+    if (pkt.outcome_type > 0) {
+        String winCorner = (pkt.winner_corner == 1) ? "red" : ((pkt.winner_corner == 2) ? "blue" : "tied");
+        String outType = (pkt.outcome_type == 1) ? "ko" : ((pkt.outcome_type == 2) ? "decision" : "forfeit");
+        matchCtrl.recordResult(winCorner, outType);
+    } else if (pkt.match_status == 2) {
+        matchCtrl.finishMatch();
     } else {
-        if (matchCtrl.isKO()) {
-            matchCtrl.clearKO();
-        }
+        matchCtrl.clearResult();
     }
 
     // Synchronize timer clock with master
@@ -257,8 +294,8 @@ void ArenaSyncManager::_applySyncPacket(const ArenaSyncPacket& pkt) {
     float currentRem = matchCtrl.getCurrentRemainingSeconds();
     ClockState currentClockState = matchCtrl.getClockState();
 
-    if (currentClockState != masterClockState || abs(masterRem - currentRem) > 0.15f) {
-        matchCtrl.syncClock(masterClockState, masterRem, pkt.duration_seconds);
+    if (currentClockState != masterClockState || abs(masterRem - currentRem) > 0.15f || masterClockState == CLOCK_COUNT_IN) {
+        matchCtrl.syncClock(masterClockState, masterRem, pkt.duration_seconds, pkt.count_in_seconds, pkt.hazards_seconds, pkt.is_hazards_active != 0, String(pkt.pause_reason));
     }
 
     // Mirror API client data as well so upcoming matches and event details render accurately

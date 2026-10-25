@@ -34,6 +34,13 @@ void networkTask(void *param) {
 void apiTask(void *param) {
     Serial.printf("[Tasks] Real-time SSE / API task started on Core %d\n", xPortGetCoreID());
     for (;;) {
+        if (wifiPortal.isOTAInProgress()) {
+            if (apiClient.isStreamConnected()) {
+                apiClient.disconnectStream();
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
         if (matchCtrl.getMode() == OPMODE_API && wifiPortal.isConnected() && !arenaSync.isSlave()) {
             if (apiClient.isKeyValid()) {
                 apiClient.handleStream();
@@ -133,6 +140,12 @@ void setup() {
 }
 
 void loop() {
+    // 0. If OTA firmware update is in progress, let the OTA progress screen stay on the matrix undisturbed
+    if (wifiPortal.isOTAInProgress()) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        return;
+    }
+
     // 1. Check user button: Hold (>3s) triggers AP mode, Tap (<1s) scrolls IP address
     buttonMgr.update();
     if (buttonMgr.isHoldTriggered()) {
@@ -175,8 +188,14 @@ void loop() {
             }
         } else if (currentMode == OPMODE_STANDALONE) {
             // Standalone Arena Match Mode
-            if (matchCtrl.isKO()) {
+            if (matchCtrl.getCurrentClockState() == CLOCK_COUNT_IN) {
+                displayMgr.setScreen(SCREEN_COUNT_IN);
+            } else if (matchCtrl.isKO()) {
                 displayMgr.setScreen(SCREEN_KO);
+            } else if (matchCtrl.getCurrentOutcomeType().length() > 0 && matchCtrl.getCurrentOutcomeType() != "ko") {
+                displayMgr.setScreen(SCREEN_DECISION);
+            } else if (matchCtrl.getCurrentMatchStatus().equalsIgnoreCase("Finished")) {
+                displayMgr.setScreen(SCREEN_FINISHED);
             } else {
                 displayMgr.setScreen(SCREEN_ACTIVE_MATCH);
             }
@@ -188,21 +207,18 @@ void loop() {
                 if (!data.valid) {
                     displayMgr.setScreen(SCREEN_ERROR);
                     displayMgr.showError("BOTSPORTS", data.error_message);
-                } else if (matchCtrl.isKO()) {
-                    displayMgr.setScreen(SCREEN_KO);
-                } else if (data.has_current_match) {
-                    ClockState cState = apiClient.getEffectiveClockState();
-                    if (cState == CLOCK_RUNNING || !data.has_upcoming_match) {
-                        displayMgr.setScreen(SCREEN_ACTIVE_MATCH);
+                } else if (apiClient.isDecisionHoldActive() || matchCtrl.getCurrentOutcomeType().length() > 0 || matchCtrl.getCurrentMatchStatus().equalsIgnoreCase("Decided")) {
+                    if (matchCtrl.getCurrentOutcomeType() == "ko") {
+                        displayMgr.setScreen(SCREEN_KO);
                     } else {
-                        // Cycle between current match (7s) and upcoming match (5s)
-                        unsigned long cycleDuration = showingUpcomingCycle ? 5000 : 7000;
-                        if (millis() - screenCycleTime >= cycleDuration) {
-                            screenCycleTime = millis();
-                            showingUpcomingCycle = !showingUpcomingCycle;
-                        }
-                        displayMgr.setScreen(showingUpcomingCycle ? SCREEN_UPCOMING_MATCH : SCREEN_ACTIVE_MATCH);
+                        displayMgr.setScreen(SCREEN_DECISION);
                     }
+                } else if (matchCtrl.getCurrentClockState() == CLOCK_COUNT_IN) {
+                    displayMgr.setScreen(SCREEN_COUNT_IN);
+                } else if (matchCtrl.getCurrentMatchStatus().equalsIgnoreCase("Finished")) {
+                    displayMgr.setScreen(SCREEN_FINISHED);
+                } else if (data.has_current_match) {
+                    displayMgr.setScreen(SCREEN_ACTIVE_MATCH);
                 } else if (data.has_upcoming_match) {
                     displayMgr.setScreen(SCREEN_UPCOMING_MATCH);
                 } else {

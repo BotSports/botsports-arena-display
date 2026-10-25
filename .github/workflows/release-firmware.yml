@@ -1,0 +1,161 @@
+name: Build & Release Firmware
+
+on:
+  push:
+    tags:
+      - 'Release-V*.*.*'
+      - 'Release-v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. Release-V1.4.0)'
+        required: true
+        default: 'Release-V1.4.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Compile ESP32-S3 Firmware & Publish Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract Semantic Version from Tag
+        id: semver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW_TAG="${{ github.event.inputs.tag_name }}"
+          else
+            RAW_TAG="${GITHUB_REF_NAME}"
+          fi
+
+          # Strip 'Release-V' or 'Release-v' prefix
+          VERSION=$(echo "$RAW_TAG" | sed -E 's/^Release-[vV]//')
+
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Error: Tag '$RAW_TAG' does not contain a valid semantic version (expected Release-VX.Y.Z)" >&2
+            exit 1
+          fi
+
+          echo "tag=${RAW_TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Detected Release Tag: ${RAW_TAG} -> Semantic Version: ${VERSION}"
+
+      - name: Stamp Firmware Version in Source Files
+        run: |
+          VERSION="${{ steps.semver.outputs.version }}"
+          echo "Updating FIRMWARE_VERSION to ${VERSION} in config.h and wifi_portal.cpp..."
+
+          sed -i -E "s/^#define[[:space:]]+FIRMWARE_VERSION[[:space:]]+\"[^\"]+\"/#define FIRMWARE_VERSION    \"${VERSION}\"/" config.h
+          sed -i -E "s/(id=\"fw_version_badge\"[^>]*>)v[^<]+/\1v${VERSION}/" wifi_portal.cpp
+          sed -i -E "s/(id=\"ota_ver_label\"[^>]*>)v[^<]+/\1v${VERSION}/" wifi_portal.cpp
+
+          grep -n "FIRMWARE_VERSION" config.h
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Cache Arduino Core & Libraries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: ${{ runner.os }}-arduino-esp32-v2
+
+      - name: Install ESP32 Core & Required Libraries
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.11 || arduino-cli core install esp32:esp32
+          arduino-cli lib install "ESP32 HUB75 LED MATRIX PANEL DMA Display" "Adafruit GFX Library" "ArduinoJson"
+
+      - name: Build Versioned Firmware Binary
+        run: |
+          chmod +x ./build.sh
+          ./build.sh
+
+          VERSION="${{ steps.semver.outputs.version }}"
+          TAG="${{ steps.semver.outputs.tag }}"
+          REPO="${{ github.repository }}"
+
+          # Generate version.json manifest for automatic OTA discovery
+          cat > dist/version.json <<EOF
+          {
+            "version": "${VERSION}",
+            "tag": "${TAG}",
+            "ota_bin": "botsports-arena-display-v${VERSION}.bin",
+            "download_url": "https://github.com/${REPO}/releases/download/${TAG}/botsports-arena-display-v${VERSION}.bin"
+          }
+          EOF
+
+          # Generate SHA-256 checksums
+          cd dist
+          sha256sum botsports-arena-display-v${VERSION}.bin > SHA256SUMS.txt
+          if [ -f "botsports-arena-display-v${VERSION}.merged.bin" ]; then
+            sha256sum botsports-arena-display-v${VERSION}.merged.bin >> SHA256SUMS.txt
+          fi
+          cat SHA256SUMS.txt
+
+      - name: Sync Version Bump Back to main Branch (if changed)
+        continue-on-error: true
+        run: |
+          VERSION="${{ steps.semver.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet config.h wifi_portal.cpp; then
+            git add config.h wifi_portal.cpp
+            git commit -m "chore(release): bump firmware version to v${VERSION} [skip ci]"
+            git push origin HEAD:main || true
+          fi
+
+      - name: Generate Release Notes
+        id: relnotes
+        run: |
+          VERSION="${{ steps.semver.outputs.version }}"
+          TAG="${{ steps.semver.outputs.tag }}"
+          PREV_TAG=$(git tag --sort=-creatordate | grep -E '^Release-[vV]' | grep -v "^${TAG}$" | head -n 1 || true)
+
+          {
+            echo "## BotSports Arena Display Firmware \`v${VERSION}\`"
+            echo ""
+            echo "### 📦 Firmware Artifacts"
+            echo "| File | Purpose |"
+            echo "| :--- | :--- |"
+            echo "| **\`botsports-arena-display-v${VERSION}.bin\`** | **OTA Update Binary** — Upload via the device Web Control Panel (**⚙ Config → Firmware Update (OTA)**) or fetch automatically from the device |"
+            echo "| **\`botsports-arena-display-v${VERSION}.merged.bin\`** | **Full Factory Image** — Complete flash image (bootloader + partitions + app) for initial USB provisioning at \`0x0000\` |"
+            echo "| **\`version.json\`** | **OTA Manifest** — Metadata used for automatic online update checks |"
+            echo ""
+            echo "### 🔐 SHA-256 Checksums"
+            echo "\`\`\`text"
+            cat dist/SHA256SUMS.txt
+            echo "\`\`\`"
+            echo ""
+            echo "### 📝 Changes"
+            if [ -n "$PREV_TAG" ]; then
+              git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges | grep -v "\[skip ci\]" || echo "- Release v${VERSION}"
+            else
+              git log -n 15 --pretty=format:"- %s (%h)" --no-merges | grep -v "\[skip ci\]" || echo "- Initial release v${VERSION}"
+            fi
+            echo ""
+          } > dist/RELEASE_NOTES.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.semver.outputs.tag }}
+          name: "BotSports Arena Display v${{ steps.semver.outputs.version }}"
+          body_path: dist/RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+          files: |
+            dist/botsports-arena-display-v${{ steps.semver.outputs.version }}.bin
+            dist/botsports-arena-display-v${{ steps.semver.outputs.version }}.merged.bin
+            dist/version.json
+            dist/SHA256SUMS.txt

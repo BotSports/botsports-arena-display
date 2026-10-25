@@ -5,8 +5,10 @@
 // ============================================================================
 // Firmware Information
 // ============================================================================
-#define FIRMWARE_VERSION    "1.1.0"
+#define FIRMWARE_VERSION    "1.3.1"
 #define DEVICE_NAME_PREFIX  "BotSports-Arena"
+#define DEFAULT_HAZARDS_SECONDS 60.0f
+
 
 // ============================================================================
 // BotSports API Configuration

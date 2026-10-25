@@ -13,6 +13,8 @@ ConfigManager::ConfigManager() {
     settings.sync_role = SYNC_ROLE_MASTER; // Default to Master / Solo
     settings.sync_key = ARENA_SYNC_DEFAULT_KEY;
     settings.op_mode = 1; // Default to Standalone (0=API, 1=Standalone)
+    settings.tournament_id = 0;
+    settings.hazards_seconds = DEFAULT_HAZARDS_SECONDS;
 }
 
 bool ConfigManager::begin() {
@@ -31,11 +33,17 @@ void ConfigManager::loadSettings() {
     settings.sync_role = _prefs.getUChar("sync_role", SYNC_ROLE_MASTER);
     settings.sync_key = _prefs.getString("sync_key", ARENA_SYNC_DEFAULT_KEY);
     settings.op_mode = _prefs.getUChar("op_mode", 1);
+    settings.tournament_id = _prefs.getInt("tourn_id", 0);
+    settings.hazards_seconds = _prefs.getFloat("hazards_sec", DEFAULT_HAZARDS_SECONDS);
     _prefs.end();
 
     if (settings.brightness == 0) {
         settings.brightness = DEFAULT_BRIGHTNESS;
     }
+    if (settings.hazards_seconds <= 0.0f) {
+        settings.hazards_seconds = DEFAULT_HAZARDS_SECONDS;
+    }
+
     if (settings.api_url.length() == 0) {
         settings.api_url = DEFAULT_API_URL_DEV;
     }
@@ -69,6 +77,8 @@ bool ConfigManager::saveSettings() {
     _prefs.putUChar("sync_role", settings.sync_role);
     _prefs.putString("sync_key", settings.sync_key);
     _prefs.putUChar("op_mode", settings.op_mode);
+    _prefs.putInt("tourn_id", settings.tournament_id);
+    _prefs.putFloat("hazards_sec", settings.hazards_seconds);
     settings.is_configured = true;
     _prefs.end();
 
@@ -91,6 +101,9 @@ void ConfigManager::resetToDefaults() {
     settings.sync_role = SYNC_ROLE_MASTER;
     settings.sync_key = ARENA_SYNC_DEFAULT_KEY;
     settings.op_mode = 1;
+    settings.tournament_id = 0;
+    settings.hazards_seconds = DEFAULT_HAZARDS_SECONDS;
 
     Serial.println("[Config] All settings reset to factory defaults");
 }
+

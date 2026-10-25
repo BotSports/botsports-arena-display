@@ -1,0 +1,6 @@
+# Build & Release Output Directories (published via GitHub Actions Releases)
+build/
+dist/
+.pio/
+*.elf
+*.map
