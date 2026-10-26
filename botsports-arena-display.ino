@@ -119,7 +119,7 @@ void setup() {
     xTaskCreatePinnedToCore(
         networkTask,
         "NetTask",
-        8192,
+        12288,
         NULL,
         2,
         NULL,

@@ -71,6 +71,8 @@ private:
     void _handleControlBrightness();
     void _handleOTAComplete();
     void _handleOTAUpload();
+    void _handleOTACheck();
+    void _handleOTAPull();
     void _handleCaptivePortal();
 
 };

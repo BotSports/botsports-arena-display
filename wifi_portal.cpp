@@ -1,6 +1,8 @@
 #include "wifi_portal.h"
 #include <ArduinoJson.h>
 #include <Update.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include "match_controller.h"
 #include "display_manager.h"
 #include "arena_sync.h"
@@ -174,6 +176,8 @@ void WiFiPortal::_setupWebServer() {
         [this]() { _handleOTAComplete(); },
         [this]() { _handleOTAUpload(); }
     );
+    _server.on("/api/ota/check", HTTP_GET, [this]() { _handleOTACheck(); });
+    _server.on("/api/ota/pull", HTTP_POST, [this]() { _handleOTAPull(); });
 
     // Arena Control Panel APIs
     _server.on("/api/control/status", HTTP_GET, [this]() { _handleControlStatus(); });
@@ -665,6 +669,313 @@ void WiFiPortal::_handleOTAUpload() {
     }
 }
 
+static void parseSemVer(String v, int& major, int& minor, int& patch) {
+    v.trim();
+    if (v.startsWith("Release-V") || v.startsWith("Release-v")) {
+        v = v.substring(9);
+    } else if (v.startsWith("v") || v.startsWith("V")) {
+        v = v.substring(1);
+    }
+    int dashIdx = v.indexOf('-');
+    if (dashIdx > 0) v = v.substring(0, dashIdx);
+
+    major = 0; minor = 0; patch = 0;
+    int p1 = v.indexOf('.');
+    if (p1 < 0) {
+        major = v.toInt();
+        return;
+    }
+    major = v.substring(0, p1).toInt();
+    int p2 = v.indexOf('.', p1 + 1);
+    if (p2 < 0) {
+        minor = v.substring(p1 + 1).toInt();
+        return;
+    }
+    minor = v.substring(p1 + 1, p2).toInt();
+    patch = v.substring(p2 + 1).toInt();
+}
+
+static int compareSemVer(const String& v1, const String& v2) {
+    int maj1, min1, pat1;
+    int maj2, min2, pat2;
+    parseSemVer(v1, maj1, min1, pat1);
+    parseSemVer(v2, maj2, min2, pat2);
+    if (maj1 != maj2) return (maj1 > maj2) ? 1 : -1;
+    if (min1 != min2) return (min1 > min2) ? 1 : -1;
+    if (pat1 != pat2) return (pat1 > pat2) ? 1 : -1;
+    return 0;
+}
+
+static bool fetchLatestGitHubRelease(String& outVersion, String& outTag, String& outDownloadUrl, size_t& outSize, String& outError) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(10);
+
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    http.setUserAgent("BotSports-Arena-Display/" FIRMWARE_VERSION);
+    http.setTimeout(10000);
+
+    if (!http.begin(client, GITHUB_LATEST_API)) {
+        outError = "Failed to initialize HTTPS connection to GitHub";
+        return false;
+    }
+    http.addHeader("Accept", "application/vnd.github+json");
+
+    int httpCode = http.GET();
+    if (httpCode != HTTP_CODE_OK) {
+        outError = (httpCode == 404)
+            ? "No published releases found on GitHub yet"
+            : ("GitHub API returned HTTP " + String(httpCode));
+        http.end();
+        return false;
+    }
+
+    JsonDocument filter;
+    filter["tag_name"] = true;
+    filter["name"] = true;
+    filter["assets"][0]["name"] = true;
+    filter["assets"][0]["browser_download_url"] = true;
+    filter["assets"][0]["size"] = true;
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+    http.end();
+
+    if (err) {
+        outError = String("Failed to parse GitHub release JSON: ") + err.c_str();
+        return false;
+    }
+
+    outTag = doc["tag_name"] | "";
+    if (outTag.length() == 0) {
+        outError = "Release tag_name missing in GitHub response";
+        return false;
+    }
+
+    outVersion = outTag;
+    if (outVersion.startsWith("Release-V") || outVersion.startsWith("Release-v")) {
+        outVersion = outVersion.substring(9);
+    } else if (outVersion.startsWith("v") || outVersion.startsWith("V")) {
+        outVersion = outVersion.substring(1);
+    }
+
+    outDownloadUrl = "";
+    outSize = 0;
+
+    if (doc["assets"].is<JsonArray>()) {
+        for (JsonObject asset : doc["assets"].as<JsonArray>()) {
+            String assetName = asset["name"] | "";
+            // Match the OTA app binary (exclude .merged.bin bootloader image)
+            if (assetName.endsWith(".bin") && !assetName.endsWith(".merged.bin") && !assetName.endsWith(".bootloader.bin") && !assetName.endsWith(".partitions.bin")) {
+                outDownloadUrl = asset["browser_download_url"] | "";
+                outSize = asset["size"] | 0;
+                break;
+            }
+        }
+    }
+
+    if (outDownloadUrl.length() == 0) {
+        outError = "Release " + outTag + " does not contain an OTA .bin artifact";
+        return false;
+    }
+
+    return true;
+}
+
+void WiFiPortal::_handleOTACheck() {
+    if (!isConnected()) {
+        _server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Device is not connected to Wi-Fi / Internet\"}");
+        return;
+    }
+
+    // Free background SSE TLS socket momentarily so plenty of heap is available for GitHub TLS
+    bool wasStreaming = apiClient.isStreamConnected();
+    if (wasStreaming) {
+        apiClient.disconnectStream();
+    }
+
+    String latestVer, latestTag, downloadUrl, err;
+    size_t assetSize = 0;
+
+    Serial.println("[OTA] Checking GitHub Releases for firmware updates...");
+    bool ok = fetchLatestGitHubRelease(latestVer, latestTag, downloadUrl, assetSize, err);
+
+    JsonDocument doc;
+    doc["current_version"] = FIRMWARE_VERSION;
+    if (!ok) {
+        Serial.printf("[OTA] Update check failed: %s\n", err.c_str());
+        doc["status"] = "error";
+        doc["message"] = err;
+        String resp;
+        serializeJson(doc, resp);
+        _server.send(200, "application/json", resp);
+        return;
+    }
+
+    int cmp = compareSemVer(latestVer, FIRMWARE_VERSION);
+    bool updateAvailable = (cmp > 0);
+
+    doc["status"] = "ok";
+    doc["latest_version"] = latestVer;
+    doc["latest_tag"] = latestTag;
+    doc["update_available"] = updateAvailable;
+    doc["download_url"] = downloadUrl;
+    doc["asset_size"] = assetSize;
+
+    Serial.printf("[OTA] Current: v%s | Latest: v%s (%s) | Update available: %s\n",
+                  FIRMWARE_VERSION, latestVer.c_str(), latestTag.c_str(), updateAvailable ? "YES" : "NO");
+
+    String resp;
+    serializeJson(doc, resp);
+    _server.send(200, "application/json", resp);
+}
+
+void WiFiPortal::_handleOTAPull() {
+    if (!isConnected()) {
+        _server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Device is not connected to Wi-Fi / Internet\"}");
+        return;
+    }
+
+    String downloadUrl = "";
+    String targetVersion = "";
+    size_t expectedSize = 0;
+
+    if (_server.hasArg("plain") && _server.arg("plain").length() > 0) {
+        JsonDocument reqDoc;
+        if (!deserializeJson(reqDoc, _server.arg("plain"))) {
+            downloadUrl = reqDoc["download_url"] | "";
+            targetVersion = reqDoc["version"] | "";
+            expectedSize = reqDoc["asset_size"] | 0;
+        }
+    }
+
+    _otaInProgress = true;
+    _otaSuccess = false;
+    _otaError = "";
+    _otaTotalBytes = 0;
+    _lastOtaDisplayPct = -1;
+    apiClient.disconnectStream();
+
+    // If no explicit URL was passed, resolve the latest release from GitHub first
+    if (downloadUrl.length() == 0) {
+        displayMgr.showOTAProgress("CHECKING...", 0);
+        String latestTag, err;
+        if (!fetchLatestGitHubRelease(targetVersion, latestTag, downloadUrl, expectedSize, err)) {
+            _otaInProgress = false;
+            displayMgr.showError("OTA FAILED", err);
+            _server.send(500, "application/json", "{\"status\":\"error\",\"message\":\"" + err + "\"}");
+            return;
+        }
+    }
+
+    _otaExpectedSize = expectedSize;
+    Serial.printf("[OTA] Downloading firmware v%s from %s\n", targetVersion.c_str(), downloadUrl.c_str());
+    displayMgr.showOTAProgress("DOWNLOADING", 0);
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(15);
+
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    http.setUserAgent("BotSports-Arena-Display/" FIRMWARE_VERSION);
+    http.setTimeout(20000);
+
+    if (!http.begin(client, downloadUrl)) {
+        _otaInProgress = false;
+        _otaError = "HTTPS init failed";
+        displayMgr.showError("OTA FAILED", _otaError);
+        _server.send(500, "application/json", "{\"status\":\"error\",\"message\":\"Failed to start HTTPS download\"}");
+        return;
+    }
+
+    int httpCode = http.GET();
+    if (httpCode != HTTP_CODE_OK) {
+        http.end();
+        _otaInProgress = false;
+        _otaError = "HTTP " + String(httpCode);
+        displayMgr.showError("OTA FAILED", _otaError);
+        _server.send(500, "application/json", "{\"status\":\"error\",\"message\":\"Download failed with HTTP " + String(httpCode) + "\"}");
+        return;
+    }
+
+    int contentLen = http.getSize();
+    if (contentLen > 0) {
+        _otaExpectedSize = (size_t)contentLen;
+    }
+
+    if (!Update.begin(_otaExpectedSize > 0 ? _otaExpectedSize : UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+        http.end();
+        _otaInProgress = false;
+        _otaError = Update.errorString();
+        displayMgr.showError("OTA FAILED", _otaError);
+        _server.send(500, "application/json", "{\"status\":\"error\",\"message\":\"Update.begin failed: " + _otaError + "\"}");
+        return;
+    }
+
+    WiFiClient* stream = http.getStreamPtr();
+    uint8_t buf[2048];
+    unsigned long lastReadTime = millis();
+
+    while (http.connected() && (_otaExpectedSize == 0 || _otaTotalBytes < _otaExpectedSize)) {
+        size_t avail = stream->available();
+        if (avail > 0) {
+            size_t toRead = (avail > sizeof(buf)) ? sizeof(buf) : avail;
+            int readBytes = stream->readBytes(buf, toRead);
+            if (readBytes > 0) {
+                lastReadTime = millis();
+                if (Update.write(buf, readBytes) != (size_t)readBytes) {
+                    _otaError = Update.errorString();
+                    Serial.printf("[OTA] Flash write error: %s\n", _otaError.c_str());
+                    break;
+                }
+                _otaTotalBytes += readBytes;
+                int pct = (_otaExpectedSize > 0)
+                    ? (int)((_otaTotalBytes * 100ULL) / _otaExpectedSize)
+                    : (int)((_otaTotalBytes * 100ULL) / 1250000ULL);
+                if (pct > 99) pct = 99;
+                if (pct - _lastOtaDisplayPct >= 5 || _lastOtaDisplayPct == -1) {
+                    _lastOtaDisplayPct = pct;
+                    displayMgr.showOTAProgress("FLASHING...", pct);
+                    Serial.printf("[OTA] Downloaded & flashed: %u / %u bytes (%d%%)\n",
+                                  (unsigned int)_otaTotalBytes, (unsigned int)_otaExpectedSize, pct);
+                }
+            }
+        } else {
+            if (millis() - lastReadTime > 15000) {
+                _otaError = "Download stream timed out";
+                Serial.println("[OTA] Download stream timed out!");
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    http.end();
+
+    if (_otaError.length() == 0 && Update.end(true)) {
+        _otaSuccess = true;
+        _otaInProgress = false;
+        Serial.printf("[OTA] Online firmware update complete (%u bytes)! Rebooting in 1.5s...\n", (unsigned int)_otaTotalBytes);
+        displayMgr.showOTAProgress("DONE! REBOOT", 100);
+        _server.send(200, "application/json",
+            "{\"status\":\"ok\",\"version\":\"" + targetVersion + "\",\"message\":\"Updated to v" + targetVersion + "! Rebooting device...\"}");
+        _shouldReboot = true;
+        _rebootTime = millis() + 1500;
+    } else {
+        if (_otaError.length() == 0) {
+            _otaError = Update.errorString();
+        }
+        Update.abort();
+        _otaInProgress = false;
+        Serial.printf("[OTA] Online firmware update failed: %s\n", _otaError.c_str());
+        displayMgr.showError("OTA FAILED", _otaError);
+        _server.send(500, "application/json", "{\"status\":\"error\",\"message\":\"OTA failed: " + _otaError + "\"}");
+    }
+}
+
 static const char PAGE_HTML[] PROGMEM = R"rawhtml(
 <!DOCTYPE html>
 <html lang="en">
@@ -773,7 +1084,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
   <div class="status-bar">
     <div>
       <strong id="device_name" style="color:var(--text);">BotSports Display</strong>
-      <span id="fw_version_badge" style="margin-left:5px;font-size:11px;color:var(--dim);">v1.3.1</span>
+      <span id="fw_version_badge" style="margin-left:5px;font-size:11px;color:var(--dim);">v1.4.0</span>
       <span id="mdns_link" style="margin-left:6px;"><a href="http://botsports-arena.local" style="color:var(--gold);text-decoration:none;">.local</a></span>
     </div>
     <span class="pill" id="conn_pill">Connecting...</span>
@@ -1063,11 +1374,28 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
     <div class="card">
       <div class="card-title">
         <span>Firmware Update (OTA)</span>
-        <span id="ota_ver_label" style="font-size:11px;color:var(--dim);">v1.3.1</span>
+        <span id="ota_ver_label" style="font-size:11px;color:var(--dim);">v1.4.0</span>
       </div>
-      <p style="font-size:12px;color:var(--dim);margin-bottom:10px;">
-        Select a compiled <code>.bin</code> firmware image to flash over Wi-Fi. All Wi-Fi and Arena settings are preserved.
-      </p>
+
+      <!-- Automatic Online GitHub Release Updater -->
+      <div style="background:#090a10;border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:10px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <strong style="font-size:12px;color:var(--text);">&#9729; Online Update (GitHub Releases)</strong>
+          <span id="ota_online_badge" class="pill ap" style="font-size:10px;padding:2px 7px;">Not Checked</span>
+        </div>
+        <div id="ota_online_msg" style="font-size:11px;color:var(--dim);margin-bottom:8px;">
+          Check GitHub (<code style="color:var(--gold);">BotSports/botsports-arena-display</code>) for the latest official firmware release.
+        </div>
+        <div class="btn-row" style="margin-bottom:0;">
+          <button type="button" class="btn-gray" id="btn_ota_check" style="font-size:12px;padding:9px;" onclick="checkOnlineOTA()">&#128269; Check for Updates</button>
+          <button type="button" class="btn-green" id="btn_ota_pull" style="display:none;font-size:12px;padding:9px;" onclick="pullOnlineOTA()">&#11015; Install Update</button>
+        </div>
+      </div>
+
+      <div style="text-align:center;font-size:10px;font-weight:700;color:var(--dim);letter-spacing:0.08em;margin:10px 0;">
+        &mdash; OR UPLOAD .BIN FILE MANUALLY &mdash;
+      </div>
+
       <input type="file" id="ota_file" accept=".bin" style="width:100%;padding:8px;background:#0c0e17;border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:12px;margin-bottom:10px;">
       <div id="ota_progress_wrap" style="display:none;margin-bottom:10px;">
         <div style="background:#090a10;border:1px solid var(--border);border-radius:6px;height:14px;overflow:hidden;margin-bottom:6px;">
@@ -1075,7 +1403,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
         </div>
         <div id="ota_status_text" style="font-size:12px;color:var(--gold);text-align:center;font-weight:700;">Uploading: 0%</div>
       </div>
-      <button type="button" class="btn-green" id="btn_ota_upload" onclick="uploadOTA()">&#11014; Upload &amp; Flash Firmware</button>
+      <button type="button" class="btn-yellow" id="btn_ota_upload" style="font-size:13px;padding:10px;" onclick="uploadOTA()">&#11014; Upload &amp; Flash .bin File</button>
     </div>
   </div>
 </div>
@@ -1467,6 +1795,145 @@ function resetDefaults() {
       showToast('Resetting and rebooting...', false);
     });
   }
+}
+
+let latestReleaseData = null;
+
+function waitForRebootAndReload() {
+  setTimeout(() => {
+    const waitTimer = setInterval(() => {
+      fetch('/api/status').then(r => r.json()).then(d => {
+        if (d && d.version) {
+          clearInterval(waitTimer);
+          window.location.reload();
+        }
+      }).catch(() => {});
+    }, 1500);
+  }, 3000);
+}
+
+function checkOnlineOTA() {
+  const checkBtn = document.getElementById('btn_ota_check');
+  const pullBtn = document.getElementById('btn_ota_pull');
+  const badge = document.getElementById('ota_online_badge');
+  const msg = document.getElementById('ota_online_msg');
+
+  checkBtn.disabled = true;
+  checkBtn.innerText = 'Checking GitHub...';
+  badge.className = 'pill ap';
+  badge.innerText = 'Checking...';
+
+  fetch('/api/ota/check')
+    .then(r => r.json())
+    .then(data => {
+      checkBtn.disabled = false;
+      checkBtn.innerText = '🔍 Check for Updates';
+
+      if (data.status !== 'ok') {
+        badge.className = 'pill ap';
+        badge.innerText = 'Unavailable';
+        msg.innerText = data.message || 'Could not reach GitHub Releases.';
+        pullBtn.style.display = 'none';
+        return;
+      }
+
+      latestReleaseData = data;
+      const sizeMB = data.asset_size ? (' (' + (data.asset_size / 1048576).toFixed(2) + ' MB)') : '';
+
+      if (data.update_available) {
+        badge.className = 'pill online';
+        badge.innerText = 'New: v' + data.latest_version;
+        msg.innerHTML = 'New firmware <strong>v' + data.latest_version + '</strong>' + sizeMB + ' is available on GitHub (installed: v' + data.current_version + ').';
+        pullBtn.style.display = 'block';
+        pullBtn.className = 'btn-green';
+        pullBtn.innerText = '⬇ Install v' + data.latest_version;
+      } else {
+        badge.className = 'pill online';
+        badge.innerText = 'Up to Date ✓';
+        msg.innerHTML = 'Device is on the latest release (<strong>v' + data.current_version + '</strong>). Latest on GitHub: v' + data.latest_version + sizeMB + '.';
+        pullBtn.style.display = 'block';
+        pullBtn.className = 'btn-gray';
+        pullBtn.innerText = '↻ Reinstall v' + data.latest_version;
+      }
+    })
+    .catch(() => {
+      checkBtn.disabled = false;
+      checkBtn.innerText = '🔍 Check for Updates';
+      badge.className = 'pill ap';
+      badge.innerText = 'Error';
+      msg.innerText = 'Network error checking for updates.';
+    });
+}
+
+function pullOnlineOTA() {
+  const ver = latestReleaseData ? latestReleaseData.latest_version : 'latest';
+  if (!confirm('Download and flash firmware v' + ver + ' directly from GitHub Releases?')) {
+    return;
+  }
+
+  const checkBtn = document.getElementById('btn_ota_check');
+  const pullBtn = document.getElementById('btn_ota_pull');
+  const uploadBtn = document.getElementById('btn_ota_upload');
+  const wrap = document.getElementById('ota_progress_wrap');
+  const bar = document.getElementById('ota_progress_bar');
+  const statusTxt = document.getElementById('ota_status_text');
+
+  checkBtn.disabled = true;
+  pullBtn.disabled = true;
+  uploadBtn.disabled = true;
+  pullBtn.innerText = 'Downloading & Flashing...';
+
+  wrap.style.display = 'block';
+  bar.style.background = 'var(--gold)';
+  bar.style.width = '15%';
+  statusTxt.innerText = 'Device is downloading & flashing v' + ver + ' from GitHub (watch LED matrix for live progress)...';
+
+  // Animate progress bar smoothly while device downloads & writes flash
+  let animPct = 15;
+  const animTimer = setInterval(() => {
+    if (animPct < 92) {
+      animPct += 4;
+      bar.style.width = animPct + '%';
+    }
+  }, 500);
+
+  const payload = latestReleaseData ? {
+    download_url: latestReleaseData.download_url,
+    version: latestReleaseData.latest_version,
+    asset_size: latestReleaseData.asset_size || 0
+  } : {};
+
+  fetch('/api/ota/pull', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+  .then(async r => {
+    clearInterval(animTimer);
+    const res = await r.json();
+    if (r.ok && res.status === 'ok') {
+      bar.style.width = '100%';
+      bar.style.background = 'var(--green)';
+      statusTxt.innerText = res.message || 'Update Complete! Waiting for device reboot...';
+      showToast(res.message || 'Firmware updated! Rebooting...', false);
+      waitForRebootAndReload();
+    } else {
+      const errMsg = res.message || 'Online firmware update failed';
+      bar.style.width = '0%';
+      statusTxt.innerText = errMsg;
+      showToast(errMsg, true);
+      checkBtn.disabled = false;
+      pullBtn.disabled = false;
+      uploadBtn.disabled = false;
+      pullBtn.innerText = '⬇ Install v' + ver;
+    }
+  })
+  .catch(() => {
+    clearInterval(animTimer);
+    // If connection dropped near completion because device started rebooting, poll for recovery
+    statusTxt.innerText = 'Verifying device reboot...';
+    waitForRebootAndReload();
+  });
 }
 
 function uploadOTA() {
