@@ -5,10 +5,11 @@
 // ============================================================================
 // Firmware Information
 // ============================================================================
-#define FIRMWARE_VERSION    "1.4.0"
+#define FIRMWARE_VERSION    "1.4.1"
 #define DEVICE_NAME_PREFIX  "BotSports-Arena"
 #define DEFAULT_HAZARDS_SECONDS 60.0f
 #define GITHUB_REPO_SLUG    "BotSports/botsports-arena-display"
+#define GITHUB_VERSION_URL  "https://github.com/BotSports/botsports-arena-display/releases/latest/download/version.json"
 #define GITHUB_LATEST_API   "https://api.github.com/repos/BotSports/botsports-arena-display/releases/latest"
 
 

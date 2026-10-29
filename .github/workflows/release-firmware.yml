@@ -84,6 +84,7 @@ jobs:
           VERSION="${{ steps.semver.outputs.version }}"
           TAG="${{ steps.semver.outputs.tag }}"
           REPO="${{ github.repository }}"
+          BIN_SIZE=$(stat -c%s "dist/botsports-arena-display-v${VERSION}.bin")
 
           # Generate version.json manifest for automatic OTA discovery
           cat > dist/version.json <<EOF
@@ -91,6 +92,7 @@ jobs:
             "version": "${VERSION}",
             "tag": "${TAG}",
             "ota_bin": "botsports-arena-display-v${VERSION}.bin",
+            "asset_size": ${BIN_SIZE},
             "download_url": "https://github.com/${REPO}/releases/download/${TAG}/botsports-arena-display-v${VERSION}.bin"
           }
           EOF

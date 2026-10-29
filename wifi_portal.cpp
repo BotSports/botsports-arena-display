@@ -47,7 +47,11 @@ bool WiFiPortal::connectToWiFi() {
 
     WiFi.disconnect(true);
     WiFi.mode(WIFI_STA);
-    WiFi.setHostname("botsports-arena");
+    WiFi.setSleep(false); // Disable modem sleep so ARP, HTTP, and UDP packets are never dropped
+    WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL); // Always pick the strongest AP/mesh node
+    WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+    WiFi.setTxPower(WIFI_POWER_15dBm); // Prevent ESP32-S3 ceramic antenna PA saturation/clipping
+    WiFi.setHostname(_apSSID.c_str());
     WiFi.begin(configMgr.settings.wifi_ssid.c_str(), configMgr.settings.wifi_pass.c_str());
 
     Serial.printf("[WiFi] Connecting to '%s' (timeout: %d s)...\n",
@@ -65,8 +69,8 @@ bool WiFiPortal::connectToWiFi() {
 
     Serial.println("\n[WiFi] Connected successfully!");
     Serial.printf("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("[WiFi] Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
-    Serial.printf("[WiFi] RSSI: %d dBm\n", WiFi.RSSI());
+    Serial.printf("[WiFi] Gateway: %s | Subnet: %s\n", WiFi.gatewayIP().toString().c_str(), WiFi.subnetMask().toString().c_str());
+    Serial.printf("[WiFi] BSSID: %s | Channel: %d | RSSI: %d dBm\n", WiFi.BSSIDstr().c_str(), WiFi.channel(), WiFi.RSSI());
     _state = WIFI_STATE_CONNECTED;
 
     // Start mDNS responder so user can navigate to http://botsports-arena.local
@@ -85,6 +89,7 @@ void WiFiPortal::startAPMode() {
     delay(100);
 
     WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);
     WiFi.softAPConfig(AP_DEFAULT_IP, AP_GATEWAY, AP_SUBNET);
     bool apStarted = WiFi.softAP(_apSSID.c_str());
 
@@ -144,6 +149,11 @@ void WiFiPortal::handle() {
             Serial.println("[WiFi] Lost WiFi connection! Reconnecting...");
             _state = WIFI_STATE_CONNECTING;
             WiFi.reconnect();
+        }
+    } else if (_state == WIFI_STATE_CONNECTING) {
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf("[WiFi] Reconnected! IP Address: %s\n", WiFi.localIP().toString().c_str());
+            _state = WIFI_STATE_CONNECTED;
         }
     }
 }
@@ -709,13 +719,36 @@ static int compareSemVer(const String& v1, const String& v2) {
 static bool fetchLatestGitHubRelease(String& outVersion, String& outTag, String& outDownloadUrl, size_t& outSize, String& outError) {
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(10);
+    client.setTimeout(12);
 
     HTTPClient http;
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
     http.setUserAgent("BotSports-Arena-Display/" FIRMWARE_VERSION);
-    http.setTimeout(10000);
+    http.setTimeout(12000);
 
+    // 1. Primary fast path: fetch lightweight version.json manifest (~240 bytes) from latest GitHub release
+    if (http.begin(client, GITHUB_VERSION_URL)) {
+        int code = http.GET();
+        if (code == HTTP_CODE_OK) {
+            String body = http.getString();
+            http.end();
+            JsonDocument doc;
+            if (!deserializeJson(doc, body)) {
+                outVersion = doc["version"] | "";
+                outTag = doc["tag"] | "";
+                outDownloadUrl = doc["download_url"] | "";
+                outSize = doc["asset_size"] | 0;
+                if (outVersion.length() > 0 && outDownloadUrl.length() > 0) {
+                    return true;
+                }
+            }
+        } else {
+            http.end();
+        }
+    }
+
+    // 2. Fallback: query GitHub Releases REST API using HTTP/1.0 (avoids chunked encoding truncation)
+    http.useHTTP10(true);
     if (!http.begin(client, GITHUB_LATEST_API)) {
         outError = "Failed to initialize HTTPS connection to GitHub";
         return false;
@@ -1084,7 +1117,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
   <div class="status-bar">
     <div>
       <strong id="device_name" style="color:var(--text);">BotSports Display</strong>
-      <span id="fw_version_badge" style="margin-left:5px;font-size:11px;color:var(--dim);">v1.4.0</span>
+      <span id="fw_version_badge" style="margin-left:5px;font-size:11px;color:var(--dim);">v1.4.1</span>
       <span id="mdns_link" style="margin-left:6px;"><a href="http://botsports-arena.local" style="color:var(--gold);text-decoration:none;">.local</a></span>
     </div>
     <span class="pill" id="conn_pill">Connecting...</span>
@@ -1374,7 +1407,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
     <div class="card">
       <div class="card-title">
         <span>Firmware Update (OTA)</span>
-        <span id="ota_ver_label" style="font-size:11px;color:var(--dim);">v1.4.0</span>
+        <span id="ota_ver_label" style="font-size:11px;color:var(--dim);">v1.4.1</span>
       </div>
 
       <!-- Automatic Online GitHub Release Updater -->
