@@ -27,9 +27,15 @@ public:
     void pauseTimer(const String& reason = "");
     void resetTimer();
     void setDuration(float seconds);
-    float getDuration() const { return _durationSec; }
+    float getDuration() const {
+        if (_mode == OPMODE_STANDALONE || _mode == OPMODE_TEST) return _durationSec;
+        return apiClient.getClockDurationSeconds();
+    }
     void setHazardsThreshold(float seconds);
-    float getHazardsThreshold() const { return _hazardsThresholdSec; }
+    float getHazardsThreshold() const {
+        if (_mode == OPMODE_STANDALONE || _mode == OPMODE_TEST) return _hazardsThresholdSec;
+        return apiClient.getHazardsThresholdSeconds();
+    }
     bool isHazardsActive() const;
     int getCountInSeconds() const { return _countInSeconds; }
     String getPauseReason() const { return _pauseReason; }

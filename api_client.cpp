@@ -68,7 +68,7 @@ bool BotSportsAPIClient::validateApiKey(const String& key, const String& url, St
     http.addHeader("X-Arena-Api-Key", key);
     http.addHeader("Accept", "application/json");
     http.addHeader("User-Agent", "BotSports-Arena-Display/" FIRMWARE_VERSION);
-    http.setTimeout(2500);
+    http.setTimeout(4000);
 
     int httpCode = http.GET();
     if (httpCode == HTTP_CODE_OK) {
@@ -326,9 +326,7 @@ void BotSportsAPIClient::handleStream() {
     // Check for deferred status polling (structural changes), ONLY when the SSE stream is idle/drained
     // and NEVER during live count-in or running match!
     if (_pendingStatusPoll && _stream && (!_stream->available())) {
-        lock();
-        ClockState curClock = _data.clock_state;
-        unlock();
+        ClockState curClock = getEffectiveClockState();
 
         if (curClock != CLOCK_RUNNING && curClock != CLOCK_COUNT_IN) {
             if ((millis() - _pendingPollTime >= 500) && (millis() - _lastPollTime >= 4000)) {
@@ -359,9 +357,12 @@ void BotSportsAPIClient::_dispatchStreamEvent(const String& eventType, const Str
 
     if (eventType == "connected") {
         Serial.printf("[%lu ms] [SSE] Connected handshake acknowledged.\n", millis());
-        if (_data.arena_id <= 0 || (millis() - _lastPollTime > 15000)) {
-            _pendingStatusPoll = true;
-            _pendingPollTime = millis();
+        ClockState curClock = getEffectiveClockState();
+        if (curClock != CLOCK_RUNNING && curClock != CLOCK_COUNT_IN) {
+            if (_data.arena_id <= 0 || (millis() - _lastPollTime > 15000)) {
+                _pendingStatusPoll = true;
+                _pendingPollTime = millis();
+            }
         }
         return;
     }
@@ -403,26 +404,32 @@ void BotSportsAPIClient::_dispatchStreamEvent(const String& eventType, const Str
                 _data.clock_state = CLOCK_STOPPED;
             }
 
-            if (clock["duration_seconds"].is<float>()) {
+            if (!clock["duration_seconds"].isNull()) {
                 _data.clock_duration_sec = clock["duration_seconds"].as<float>();
             }
-            if (clock["hazards_seconds"].is<float>()) {
+            if (!clock["hazards_seconds"].isNull()) {
                 _data.clock_hazards_sec = clock["hazards_seconds"].as<float>();
+            }
+            if (_data.clock_hazards_sec <= 0.0f) {
+                _data.clock_hazards_sec = (configMgr.settings.hazards_seconds > 0.0f)
+                    ? configMgr.settings.hazards_seconds
+                    : DEFAULT_HAZARDS_SECONDS;
             }
             _data.is_hazards_active = clock["is_hazards_active"] | false;
 
-            if (clock["remaining_seconds"].is<float>()) {
+            if (!clock["remaining_seconds"].isNull()) {
                 _data.clock_remaining_sec = clock["remaining_seconds"].as<float>();
             }
-            if (clock.containsKey("count_in_seconds")) {
+            if (clock.containsKey("count_in_seconds") && !clock["count_in_seconds"].isNull()) {
                 _data.clock_count_in_seconds = clock["count_in_seconds"].as<int>();
             }
             _data.clock_pause_reason = clock["pause_reason"] | "";
             _data.clock_sync_millis = millis();
             unlock();
 
-            Serial.printf("[%lu ms] [Clock] State: %s, CountIn: %d, Rem: %.2f, Haz: %d\n",
-                          millis(), statusStr.c_str(), _data.clock_count_in_seconds, _data.clock_remaining_sec, (int)_data.is_hazards_active);
+            Serial.printf("[%lu ms] [Clock] State: %s, CountIn: %d, Rem: %.2f, HazSec: %.1f, HazActive: %d\n",
+                          millis(), statusStr.c_str(), _data.clock_count_in_seconds, _data.clock_remaining_sec,
+                          _data.clock_hazards_sec, (int)_data.is_hazards_active);
 
             // If count-in, set display screen to SCREEN_COUNT_IN
             if (_data.clock_state == CLOCK_COUNT_IN) {
@@ -587,8 +594,10 @@ bool BotSportsAPIClient::pollStatus() {
 
     if (!http.begin(_secureClient, url)) {
         lock();
-        _data.valid = false;
-        _data.error_message = "HTTP connection failed";
+        if (!_data.valid || _data.arena_id <= 0) {
+            _data.valid = false;
+            _data.error_message = "HTTP connection failed";
+        }
         unlock();
         return false;
     }
@@ -596,7 +605,7 @@ bool BotSportsAPIClient::pollStatus() {
     http.addHeader("X-Arena-Api-Key", configMgr.settings.api_key);
     http.addHeader("Accept", "application/json");
     http.addHeader("User-Agent", "BotSports-Arena-Display/" FIRMWARE_VERSION);
-    http.setTimeout(2500);
+    http.setTimeout(4000);
 
     int httpCode = http.GET();
 
@@ -622,14 +631,17 @@ bool BotSportsAPIClient::pollStatus() {
         return true;
     } else {
         String errMsg;
+        bool authError = false;
         if (httpCode == 401 || httpCode == 403) {
             errMsg = "Invalid Arena Key";
+            authError = true;
             lock();
             _keyValid = false;
             _keyValidationError = errMsg;
             unlock();
         } else if (httpCode == 404) {
             errMsg = "Arena Not Found";
+            authError = true;
         } else if (httpCode < 0) {
             errMsg = "Network Timeout";
         } else {
@@ -639,9 +651,14 @@ bool BotSportsAPIClient::pollStatus() {
         http.end();
 
         lock();
-        _data.valid = false;
         _data.http_code = httpCode;
-        _data.error_message = errMsg;
+        // Preserve valid arena/match display state on transient network timeouts or 5xx errors
+        if (authError || !_data.valid || _data.arena_id <= 0) {
+            _data.valid = false;
+            _data.error_message = errMsg;
+        } else {
+            Serial.printf("[%lu ms] [Poll] Retaining cached arena state despite transient %s\n", millis(), errMsg.c_str());
+        }
         unlock();
         return false;
     }
@@ -816,11 +833,11 @@ void BotSportsAPIClient::_parseStatusJson(const String& payload, ArenaStatusData
 bool BotSportsAPIClient::isHazardsActive() const {
     lock();
     bool active = _data.is_hazards_active;
-    float hSec = _data.clock_hazards_sec;
-    ClockState st = _data.clock_state;
+    float hSec = (_data.clock_hazards_sec > 0.0f) ? _data.clock_hazards_sec : DEFAULT_HAZARDS_SECONDS;
     unlock();
     if (active) return true;
-    if (st == CLOCK_RUNNING) {
+    ClockState st = getEffectiveClockState();
+    if (st == CLOCK_RUNNING || st == CLOCK_PAUSED) {
         float rem = getInterpolatedRemainingSeconds();
         if (rem <= hSec && rem > 0.0f) return true;
     }
@@ -897,9 +914,10 @@ ClockState BotSportsAPIClient::getEffectiveClockState() const {
     if (st == CLOCK_COUNT_IN) {
         float elapsed = (millis() - syncTime) / 1000.0f;
         if (elapsed >= 4.0f) {
-            return CLOCK_RUNNING;
+            st = CLOCK_RUNNING;
+        } else {
+            return CLOCK_COUNT_IN;
         }
-        return CLOCK_COUNT_IN;
     }
 
     if (st == CLOCK_RUNNING && getInterpolatedRemainingSeconds() <= 0.0f) {

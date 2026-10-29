@@ -71,10 +71,10 @@ bool DisplayManager::begin() {
     mxconfig.gpio.clk = PIN_CLK;
 
     // Hardware timing & anti-flicker configuration:
-    // 1. Positive edge clocking prevents clock edge race conditions on shift registers
+    // 1. Positive edge clocking + 10MHz I2S clock prevents 3.3V->5V shift register setup-time pixel glitches
     mxconfig.clkphase = true;
     mxconfig.driver = HUB75_I2S_CFG::SHIFTREG;
-    mxconfig.i2sspeed = HUB75_I2S_CFG::HZ_16M;
+    mxconfig.i2sspeed = HUB75_I2S_CFG::HZ_10M;
     // 2. Blank OE for 4 clock ticks during row address latch to eliminate row bleed/ghosting
     mxconfig.latch_blanking = 4;
     // 3. Double-buffering prevents tearing and visual redraw flicker
@@ -392,7 +392,7 @@ void DisplayManager::_renderActiveMatch() {
         label.toUpperCase();
         _dmaDisplay->fillRect(0, 0, PANEL_RES_X, 9, _colorYellow);
         _drawScrollingText(0, 1, "PAUSED: " + label, _colorBlack, _marqueeOffsetBanner, PANEL_RES_X, _colorYellow);
-    } else if (hazardsActive && cState == CLOCK_RUNNING) {
+    } else if (hazardsActive && (cState == CLOCK_RUNNING || cState == CLOCK_PAUSED)) {
         if (_flashState) {
             _dmaDisplay->fillRect(0, 0, PANEL_RES_X, 9, _colorRed);
             _dmaDisplay->setTextSize(1);
@@ -409,7 +409,7 @@ void DisplayManager::_renderActiveMatch() {
             _dmaDisplay->print("HAZARD");
         }
     } else {
-        String headerRight = (matchCtrl.getMode() == OPMODE_STANDALONE) ? "LOCAL" : apiClient.getData().arena_name;
+        String headerRight = (matchCtrl.getMode() == OPMODE_STANDALONE) ? "LOCAL" : apiClient.getArenaName();
         if (headerRight.length() == 0) headerRight = "ARENA";
         _drawScrollingText(36, 1, headerRight, _colorWhite, _marqueeOffsetBanner, PANEL_RES_X - 36, _colorBlack);
 
@@ -467,25 +467,27 @@ void DisplayManager::_renderActiveMatch() {
     String myCorner = configMgr.settings.corner;
     if (myCorner == "red") {
         // Red Corner Display Unit: emphasize Red Fighter
-        _dmaDisplay->fillRect(0, 26, PANEL_RES_X, 14, _dmaDisplay->color565(50, 5, 5));
-        _drawScrollingText(15, 26, "RED: " + redName, _colorWhite, _marqueeOffsetRed, PANEL_RES_X - 15, _dmaDisplay->color565(50, 5, 5));
+        uint16_t redBg = _dmaDisplay->color565(90, 10, 10);
+        _dmaDisplay->fillRect(0, 26, PANEL_RES_X, 14, redBg);
+        _drawScrollingText(15, 26, "RED: " + redName, _colorWhite, _marqueeOffsetRed, PANEL_RES_X - 15, redBg);
         _dmaDisplay->fillRect(1, 28, 3, 4, _colorRed);
         _dmaDisplay->fillRect(5, 29, 2, 2, rPit ? _colorOrange : _colorDarkGray);
         _dmaDisplay->fillRect(8, 29, 2, 2, rGate ? _colorCyan : _colorDarkGray);
         _dmaDisplay->fillRect(11, 29, 2, 2, rMatch ? _colorGreen : _colorDarkGray);
 
-        _drawScrollingText(7, 33, "vs " + blueName, _colorBrightGray, _marqueeOffsetBlue, PANEL_RES_X - 7, _dmaDisplay->color565(50, 5, 5));
+        _drawScrollingText(7, 33, "vs " + blueName, _colorBrightGray, _marqueeOffsetBlue, PANEL_RES_X - 7, redBg);
         _dmaDisplay->fillRect(1, 35, 3, 3, _colorBlue);
     } else if (myCorner == "blue") {
         // Blue Corner Display Unit: emphasize Blue Fighter
-        _dmaDisplay->fillRect(0, 26, PANEL_RES_X, 14, _dmaDisplay->color565(5, 15, 50));
-        _drawScrollingText(15, 26, "BLU: " + blueName, _colorWhite, _marqueeOffsetBlue, PANEL_RES_X - 15, _dmaDisplay->color565(5, 15, 50));
+        uint16_t blueBg = _dmaDisplay->color565(10, 28, 100);
+        _dmaDisplay->fillRect(0, 26, PANEL_RES_X, 14, blueBg);
+        _drawScrollingText(15, 26, "BLU: " + blueName, _colorWhite, _marqueeOffsetBlue, PANEL_RES_X - 15, blueBg);
         _dmaDisplay->fillRect(1, 28, 3, 4, _colorBlue);
         _dmaDisplay->fillRect(5, 29, 2, 2, bPit ? _colorOrange : _colorDarkGray);
         _dmaDisplay->fillRect(8, 29, 2, 2, bGate ? _colorCyan : _colorDarkGray);
         _dmaDisplay->fillRect(11, 29, 2, 2, bMatch ? _colorGreen : _colorDarkGray);
 
-        _drawScrollingText(7, 33, "vs " + redName, _colorBrightGray, _marqueeOffsetRed, PANEL_RES_X - 7, _dmaDisplay->color565(5, 15, 50));
+        _drawScrollingText(7, 33, "vs " + redName, _colorBrightGray, _marqueeOffsetRed, PANEL_RES_X - 7, blueBg);
         _dmaDisplay->fillRect(1, 35, 3, 3, _colorRed);
     } else {
         // Standard Dual Arena Display: both names scroll horizontally with readiness dots

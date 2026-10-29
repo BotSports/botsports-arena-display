@@ -202,11 +202,9 @@ void loop() {
         } else {
             // OPMODE_API: Synchronized with BotSports API (Master Display)
             if (wifiPortal.isConnected()) {
-                ArenaStatusData data = apiClient.getData();
-
-                if (!data.valid) {
+                if (!apiClient.isValid()) {
                     displayMgr.setScreen(SCREEN_ERROR);
-                    displayMgr.showError("BOTSPORTS", data.error_message);
+                    displayMgr.showError("BOTSPORTS", apiClient.getErrorMessage());
                 } else if (apiClient.isDecisionHoldActive() || matchCtrl.getCurrentOutcomeType().length() > 0 || matchCtrl.getCurrentMatchStatus().equalsIgnoreCase("Decided")) {
                     if (matchCtrl.getCurrentOutcomeType() == "ko") {
                         displayMgr.setScreen(SCREEN_KO);
@@ -217,9 +215,9 @@ void loop() {
                     displayMgr.setScreen(SCREEN_COUNT_IN);
                 } else if (matchCtrl.getCurrentMatchStatus().equalsIgnoreCase("Finished")) {
                     displayMgr.setScreen(SCREEN_FINISHED);
-                } else if (data.has_current_match) {
+                } else if (apiClient.hasCurrentMatch()) {
                     displayMgr.setScreen(SCREEN_ACTIVE_MATCH);
-                } else if (data.has_upcoming_match) {
+                } else if (apiClient.hasUpcomingMatch()) {
                     displayMgr.setScreen(SCREEN_UPCOMING_MATCH);
                 } else {
                     displayMgr.setScreen(SCREEN_IDLE_EVENT);

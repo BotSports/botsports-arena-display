@@ -17,20 +17,20 @@ enum ClockState {
 };
 
 struct BotCombatant {
-    int bot_id;
+    int bot_id = 0;
     String name;
     String team;
-    bool pit_ready;
-    bool arena_checked_in;
-    bool ready; // match_ready
-    float score;
+    bool pit_ready = false;
+    bool arena_checked_in = false;
+    bool ready = false; // match_ready
+    float score = 0.0f;
     String result_type;
 };
 
 struct MatchInfo {
-    int id;
-    int round_number;
-    int match_number;
+    int id = 0;
+    int round_number = 1;
+    int match_number = 1;
     String status; // "Scheduled", "Ongoing", "Finished", "Decided", "Completed", etc.
     BotCombatant red;
     BotCombatant blue;
@@ -40,36 +40,36 @@ struct MatchInfo {
 };
 
 struct ArenaStatusData {
-    bool valid;
+    bool valid = false;
     String error_message;
-    int http_code;
+    int http_code = 0;
 
     // Arena Info
-    int arena_id;
+    int arena_id = 0;
     String arena_name;
-    bool has_active_event;
-    int active_event_id;
+    bool has_active_event = false;
+    int active_event_id = 0;
     String active_event_name;
-    int current_tournament_id;
+    int current_tournament_id = 0;
     String current_tournament_name;
 
     // Current Match
-    bool has_current_match;
+    bool has_current_match = false;
     MatchInfo current_match;
 
     // Match Clock
-    bool has_clock;
-    ClockState clock_state;
-    float clock_duration_sec;
-    float clock_hazards_sec;
-    bool is_hazards_active;
-    float clock_remaining_sec;
-    int clock_count_in_seconds; // 3, 2, 1, 0, or -1
+    bool has_clock = false;
+    ClockState clock_state = CLOCK_STOPPED;
+    float clock_duration_sec = 180.0f;
+    float clock_hazards_sec = DEFAULT_HAZARDS_SECONDS;
+    bool is_hazards_active = false;
+    float clock_remaining_sec = 180.0f;
+    int clock_count_in_seconds = -1; // 3, 2, 1, 0, or -1
     String clock_pause_reason;
-    unsigned long clock_sync_millis; // local millis() at time of sync
+    unsigned long clock_sync_millis = 0; // local millis() at time of sync
 
     // Upcoming Match
-    bool has_upcoming_match;
+    bool has_upcoming_match = false;
     MatchInfo upcoming_match;
 };
 
@@ -138,9 +138,45 @@ public:
         bMatch = _data.current_match.blue.ready;
         unlock();
     }
+    bool isValid() const {
+        lock();
+        bool v = _data.valid;
+        unlock();
+        return v;
+    }
+    String getErrorMessage() const {
+        lock();
+        String s = _data.error_message;
+        unlock();
+        return s;
+    }
+    String getArenaName() const {
+        lock();
+        String s = _data.arena_name;
+        unlock();
+        return s;
+    }
     bool hasCurrentMatch() const {
         lock();
         bool h = _data.has_current_match;
+        unlock();
+        return h;
+    }
+    bool hasUpcomingMatch() const {
+        lock();
+        bool h = _data.has_upcoming_match;
+        unlock();
+        return h;
+    }
+    float getClockDurationSeconds() const {
+        lock();
+        float d = (_data.clock_duration_sec > 0.0f) ? _data.clock_duration_sec : 180.0f;
+        unlock();
+        return d;
+    }
+    float getHazardsThresholdSeconds() const {
+        lock();
+        float h = (_data.clock_hazards_sec > 0.0f) ? _data.clock_hazards_sec : DEFAULT_HAZARDS_SECONDS;
         unlock();
         return h;
     }
