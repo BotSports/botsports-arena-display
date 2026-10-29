@@ -87,7 +87,9 @@ String ArenaSyncManager::getSyncStatusText() const {
 void ArenaSyncManager::broadcastState(bool immediate) {
     if (!isMaster() || !_udpStarted) return;
 
-    if (!immediate && (millis() - _lastBroadcastMillis < ARENA_SYNC_BROADCAST_MS)) {
+    int activeSlaves = getSlaveCount();
+    unsigned long interval = (activeSlaves > 0) ? ARENA_SYNC_BROADCAST_MS : 3000;
+    if ((!immediate || activeSlaves == 0) && (millis() - _lastBroadcastMillis < interval)) {
         return;
     }
     _lastBroadcastMillis = millis();

@@ -161,13 +161,11 @@ bool BotSportsAPIClient::connectStream() {
     if (_data.arena_id <= 0) {
         pollStatus();
     }
-
-    String streamPath;
-    if (_data.arena_id > 0) {
-        streamPath = basePath + "/app/arenas/" + String(_data.arena_id) + "/stream";
-    } else {
-        streamPath = basePath + "/app/arenas/device/stream";
+    if (_data.arena_id <= 0) {
+        return false;
     }
+
+    String streamPath = basePath + "/app/arenas/" + String(_data.arena_id) + "/stream";
     Serial.printf("[SSE] Connecting to %s:%d%s ...\n", host.c_str(), port, streamPath.c_str());
 
     if (isHttps) {
@@ -284,42 +282,47 @@ void BotSportsAPIClient::handleStream() {
         return;
     }
 
-    // Read incoming SSE stream data character-by-character (strictly non-blocking, zero truncation!)
-    while (_stream && _stream->connected() && _stream->available()) {
-        char c = (char)_stream->read();
+    // Read incoming SSE stream data in chunks (fast, non-blocking, zero per-byte ioctl overhead!)
+    uint8_t buf[256];
+    while (_stream && _stream->available() > 0) {
+        int n = _stream->read(buf, sizeof(buf));
+        if (n <= 0) break;
         _lastStreamDataReceived = millis();
-        if (c == '\r') continue;
-        if (c == '\n') {
-            String line = _streamLineBuffer;
-            _streamLineBuffer = "";
-            line.trim();
+        for (int i = 0; i < n; i++) {
+            char c = (char)buf[i];
+            if (c == '\r') continue;
+            if (c == '\n') {
+                String line = _streamLineBuffer;
+                _streamLineBuffer = "";
+                line.trim();
 
-            // Handle SSE comment / keepalive ping (e.g. ": ping")
-            if (line.startsWith(":")) {
-                Serial.printf("[%lu ms] [SSE] Keepalive ping received\n", millis());
-                continue;
-            }
+                // Handle SSE comment / keepalive ping (e.g. ": ping")
+                if (line.startsWith(":")) {
+                    Serial.printf("[%lu ms] [SSE] Keepalive ping received\n", millis());
+                    continue;
+                }
 
-            if (line.startsWith("event:")) {
-                _currentSseEvent = line.substring(6);
-                _currentSseEvent.trim();
-            } else if (line.startsWith("data:")) {
-                String dataPart = line.substring(5);
-                dataPart.trim();
-                if (_currentSseData.length() > 0) {
-                    _currentSseData += "\n";
+                if (line.startsWith("event:")) {
+                    _currentSseEvent = line.substring(6);
+                    _currentSseEvent.trim();
+                } else if (line.startsWith("data:")) {
+                    String dataPart = line.substring(5);
+                    dataPart.trim();
+                    if (_currentSseData.length() > 0) {
+                        _currentSseData += "\n";
+                    }
+                    _currentSseData += dataPart;
+                } else if (line.length() == 0) {
+                    // End of SSE block (double newline)
+                    if (_currentSseEvent.length() > 0 || _currentSseData.length() > 0) {
+                        _dispatchStreamEvent(_currentSseEvent, _currentSseData);
+                        _currentSseEvent = "";
+                        _currentSseData = "";
+                    }
                 }
-                _currentSseData += dataPart;
-            } else if (line.length() == 0) {
-                // End of SSE block (double newline)
-                if (_currentSseEvent.length() > 0 || _currentSseData.length() > 0) {
-                    _dispatchStreamEvent(_currentSseEvent, _currentSseData);
-                    _currentSseEvent = "";
-                    _currentSseData = "";
-                }
+            } else {
+                _streamLineBuffer += c;
             }
-        } else {
-            _streamLineBuffer += c;
         }
     }
 
@@ -389,7 +392,17 @@ void BotSportsAPIClient::_dispatchStreamEvent(const String& eventType, const Str
         }
 
         if (!clock.isNull()) {
+            int clkMatchId = payloadObj["match_id"] | doc["match_id"] | 0;
             lock();
+            if (clkMatchId > 0 && clkMatchId != _data.current_match.id) {
+                _decisionHoldUntil = 0;
+                if (_data.has_upcoming_match && clkMatchId == _data.upcoming_match.id) {
+                    _data.current_match = _data.upcoming_match;
+                    _data.current_match.status = "Ongoing";
+                    _data.has_current_match = true;
+                    _data.has_upcoming_match = false;
+                }
+            }
             _data.has_clock = true;
             String statusStr = clock["status"] | "stopped";
             if (statusStr.equalsIgnoreCase("running")) {
@@ -453,7 +466,40 @@ void BotSportsAPIClient::_dispatchStreamEvent(const String& eventType, const Str
         int matchId = payloadObj["match_id"] | doc["match_id"] | 0;
         int botId = payloadObj["bot_id"] | doc["bot_id"] | 0;
 
+        auto extractReadyVal = [&](bool& outVal) -> bool {
+            if (payloadObj.containsKey("bot_ready")) { outVal = (bool)payloadObj["bot_ready"]; return true; }
+            if (payloadObj.containsKey("match_ready")) { outVal = (bool)payloadObj["match_ready"]; return true; }
+            if (payloadObj.containsKey("ready")) { outVal = (bool)payloadObj["ready"]; return true; }
+            if (doc.containsKey("bot_ready")) { outVal = (bool)doc["bot_ready"]; return true; }
+            if (doc.containsKey("match_ready")) { outVal = (bool)doc["match_ready"]; return true; }
+            if (doc.containsKey("ready")) { outVal = (bool)doc["ready"]; return true; }
+            return false;
+        };
+
         lock();
+        // If referee is updating readiness on the next match while Decision Hold is active (or before poll),
+        // immediately end Decision Hold and promote upcoming_match if it matches!
+        if (matchId > 0 && matchId != _data.current_match.id) {
+            _decisionHoldUntil = 0;
+            if (_data.has_upcoming_match && matchId == _data.upcoming_match.id) {
+                Serial.printf("[%lu ms] [Readiness] Promoting upcoming match %d to current match immediately!\n", millis(), matchId);
+                _data.current_match = _data.upcoming_match;
+                _data.current_match.status = "Scheduled";
+                _data.has_current_match = true;
+                _data.has_upcoming_match = false;
+                _data.clock_state = CLOCK_STOPPED;
+                _data.clock_remaining_sec = _data.clock_duration_sec;
+                _data.is_hazards_active = false;
+                _pendingStatusPoll = true;
+                _pendingPollTime = millis();
+            } else {
+                // Unknown new match ID -> trigger immediate status poll
+                _pendingStatusPoll = true;
+                _pendingPollTime = millis() - 500;
+                _lastPollTime = 0;
+            }
+        }
+
         // Check current match
         if (matchId == 0 || matchId == _data.current_match.id) {
             bool isRed = (botId > 0 && botId == _data.current_match.red.bot_id);
@@ -475,12 +521,10 @@ void BotSportsAPIClient::_dispatchStreamEvent(const String& eventType, const Str
                 if (isRed) _data.current_match.red.arena_checked_in = v;
                 if (isBlue) _data.current_match.blue.arena_checked_in = v;
             }
-            if (payloadObj.containsKey("bot_ready") || payloadObj.containsKey("ready") || payloadObj.containsKey("match_ready") ||
-                doc.containsKey("bot_ready") || doc.containsKey("ready") || doc.containsKey("match_ready")) {
-                bool v = payloadObj["bot_ready"] | payloadObj["ready"] | payloadObj["match_ready"] |
-                         doc["bot_ready"] | doc["ready"] | doc["match_ready"];
-                if (isRed) _data.current_match.red.ready = v;
-                if (isBlue) _data.current_match.blue.ready = v;
+            bool rVal = false;
+            if (extractReadyVal(rVal)) {
+                if (isRed) _data.current_match.red.ready = rVal;
+                if (isBlue) _data.current_match.blue.ready = rVal;
             }
         }
 
@@ -505,12 +549,10 @@ void BotSportsAPIClient::_dispatchStreamEvent(const String& eventType, const Str
                 if (isRed) _data.upcoming_match.red.arena_checked_in = v;
                 if (isBlue) _data.upcoming_match.blue.arena_checked_in = v;
             }
-            if (payloadObj.containsKey("bot_ready") || payloadObj.containsKey("ready") || payloadObj.containsKey("match_ready") ||
-                doc.containsKey("bot_ready") || doc.containsKey("ready") || doc.containsKey("match_ready")) {
-                bool v = payloadObj["bot_ready"] | payloadObj["ready"] | payloadObj["match_ready"] |
-                         doc["bot_ready"] | doc["ready"] | doc["match_ready"];
-                if (isRed) _data.upcoming_match.red.ready = v;
-                if (isBlue) _data.upcoming_match.blue.ready = v;
+            bool rVal = false;
+            if (extractReadyVal(rVal)) {
+                if (isRed) _data.upcoming_match.red.ready = rVal;
+                if (isBlue) _data.upcoming_match.blue.ready = rVal;
             }
         }
         unlock();
@@ -818,12 +860,18 @@ void BotSportsAPIClient::_parseStatusJson(const String& payload, ArenaStatusData
             target.upcoming_match.red.bot_id = c0["bot_id"] | 0;
             target.upcoming_match.red.name = c0["bot_name"] | "Red Bot";
             target.upcoming_match.red.team = c0["team_name"] | "";
+            target.upcoming_match.red.pit_ready = c0["pit_ready"] | false;
+            target.upcoming_match.red.arena_checked_in = c0["arena_checked_in"] | false;
+            target.upcoming_match.red.ready = c0["match_ready"] | c0["bot_ready"] | c0["ready"] | false;
         }
         if (combatants.size() > 1) {
             JsonObject c1 = combatants[1];
             target.upcoming_match.blue.bot_id = c1["bot_id"] | 0;
             target.upcoming_match.blue.name = c1["bot_name"] | "Blue Bot";
             target.upcoming_match.blue.team = c1["team_name"] | "";
+            target.upcoming_match.blue.pit_ready = c1["pit_ready"] | false;
+            target.upcoming_match.blue.arena_checked_in = c1["arena_checked_in"] | false;
+            target.upcoming_match.blue.ready = c1["match_ready"] | c1["bot_ready"] | c1["ready"] | false;
         }
     } else {
         target.has_upcoming_match = false;
@@ -988,6 +1036,9 @@ bool BotSportsAPIClient::fetchMatchOutcome(int matchId) {
 
 void BotSportsAPIClient::_handleMatchCompleted(int matchId, JsonDocument& doc) {
     lock();
+    bool alreadyHoldingSameMatch = (_decisionHoldUntil > 0 && millis() < _decisionHoldUntil &&
+                                    _data.current_match.id == matchId &&
+                                    _data.current_match.winner_name.length() > 0);
     _data.current_match.status = "Decided";
     if (doc.containsKey("winner_corner")) {
         _data.current_match.winner_corner = doc["winner_corner"].as<String>();
@@ -1000,6 +1051,10 @@ void BotSportsAPIClient::_handleMatchCompleted(int matchId, JsonDocument& doc) {
     }
     String curWinName = _data.current_match.winner_name;
     unlock();
+
+    if (alreadyHoldingSameMatch) {
+        return; // Avoid duplicate blocking fetchMatchOutcome() when match.status_changed + match_completed both fire
+    }
 
     if (curWinName.length() == 0 && matchId > 0) {
         fetchMatchOutcome(matchId);

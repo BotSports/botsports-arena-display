@@ -47,7 +47,6 @@ bool WiFiPortal::connectToWiFi() {
 
     WiFi.disconnect(true);
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false); // Disable modem sleep so ARP, HTTP, and UDP packets are never dropped
     WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL); // Always pick the strongest AP/mesh node
     WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
     WiFi.setTxPower(WIFI_POWER_15dBm); // Prevent ESP32-S3 ceramic antenna PA saturation/clipping
@@ -89,7 +88,6 @@ void WiFiPortal::startAPMode() {
     delay(100);
 
     WiFi.mode(WIFI_AP_STA);
-    WiFi.setSleep(false);
     WiFi.softAPConfig(AP_DEFAULT_IP, AP_GATEWAY, AP_SUBNET);
     bool apStarted = WiFi.softAP(_apSSID.c_str());
 
@@ -420,11 +418,11 @@ void WiFiPortal::_handleControlStatus() {
 
     doc["active_test"] = matchCtrl.getActiveTestName();
     doc["brightness"] = configMgr.settings.brightness;
-    doc["has_api_match"] = apiClient.getData().has_current_match;
+    doc["has_api_match"] = apiClient.hasCurrentMatch();
     doc["api_key_valid"] = apiClient.isKeyValid();
     doc["stream_connected"] = apiClient.isStreamConnected();
     doc["key_validation_error"] = apiClient.getKeyValidationError();
-    doc["clock_pause_reason"] = apiClient.getData().clock_pause_reason;
+    doc["clock_pause_reason"] = apiClient.getPauseReason();
 
     doc["sync_role"] = configMgr.settings.sync_role;
     doc["sync_key"] = configMgr.settings.sync_key;
@@ -601,6 +599,7 @@ void WiFiPortal::_handleControlBrightness() {
 
 void WiFiPortal::_handleOTAComplete() {
     _otaInProgress = false;
+    WiFi.setSleep(true);
     if (_otaSuccess && !Update.hasError()) {
         Serial.println("[OTA] Firmware update complete! Rebooting in 1.5s...");
         displayMgr.showOTAProgress("DONE! REBOOT", 100);
@@ -620,6 +619,7 @@ void WiFiPortal::_handleOTAUpload() {
 
     if (upload.status == UPLOAD_FILE_START) {
         _otaInProgress = true;
+        WiFi.setSleep(false);
         _otaSuccess = false;
         _otaError = "";
         _otaTotalBytes = 0;
@@ -886,6 +886,7 @@ void WiFiPortal::_handleOTAPull() {
     }
 
     _otaInProgress = true;
+    WiFi.setSleep(false);
     _otaSuccess = false;
     _otaError = "";
     _otaTotalBytes = 0;
@@ -1119,7 +1120,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
   <div class="status-bar">
     <div>
       <strong id="device_name" style="color:var(--text);">BotSports Display</strong>
-      <span id="fw_version_badge" style="margin-left:5px;font-size:11px;color:var(--dim);">v1.4.2</span>
+      <span id="fw_version_badge" style="margin-left:5px;font-size:11px;color:var(--dim);">v1.4.3</span>
       <span id="mdns_link" style="margin-left:6px;"><a href="http://botsports-arena.local" style="color:var(--gold);text-decoration:none;">.local</a></span>
     </div>
     <span class="pill" id="conn_pill">Connecting...</span>
@@ -1409,7 +1410,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
     <div class="card">
       <div class="card-title">
         <span>Firmware Update (OTA)</span>
-        <span id="ota_ver_label" style="font-size:11px;color:var(--dim);">v1.4.2</span>
+        <span id="ota_ver_label" style="font-size:11px;color:var(--dim);">v1.4.3</span>
       </div>
 
       <!-- Automatic Online GitHub Release Updater -->

@@ -71,10 +71,10 @@ bool DisplayManager::begin() {
     mxconfig.gpio.clk = PIN_CLK;
 
     // Hardware timing & anti-flicker configuration:
-    // 1. Positive edge clocking + 10MHz I2S clock prevents 3.3V->5V shift register setup-time pixel glitches
+    // 1. Positive edge clocking prevents clock edge race conditions on shift registers
     mxconfig.clkphase = true;
     mxconfig.driver = HUB75_I2S_CFG::SHIFTREG;
-    mxconfig.i2sspeed = HUB75_I2S_CFG::HZ_10M;
+    mxconfig.i2sspeed = HUB75_I2S_CFG::HZ_16M;
     // 2. Blank OE for 4 clock ticks during row address latch to eliminate row bleed/ghosting
     mxconfig.latch_blanking = 4;
     // 3. Double-buffering prevents tearing and visual redraw flicker
