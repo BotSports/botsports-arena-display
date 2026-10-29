@@ -1120,7 +1120,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
   <div class="status-bar">
     <div>
       <strong id="device_name" style="color:var(--text);">BotSports Display</strong>
-      <span id="fw_version_badge" style="margin-left:5px;font-size:11px;color:var(--dim);">v1.4.3</span>
+      <span id="fw_version_badge" style="margin-left:5px;font-size:11px;color:var(--dim);">v1.4.4</span>
       <span id="mdns_link" style="margin-left:6px;"><a href="http://botsports-arena.local" style="color:var(--gold);text-decoration:none;">.local</a></span>
     </div>
     <span class="pill" id="conn_pill">Connecting...</span>
@@ -1410,7 +1410,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
     <div class="card">
       <div class="card-title">
         <span>Firmware Update (OTA)</span>
-        <span id="ota_ver_label" style="font-size:11px;color:var(--dim);">v1.4.3</span>
+        <span id="ota_ver_label" style="font-size:11px;color:var(--dim);">v1.4.4</span>
       </div>
 
       <!-- Automatic Online GitHub Release Updater -->

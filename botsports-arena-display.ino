@@ -61,6 +61,11 @@ void apiTask(void *param) {
 
 void setup() {
     Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT
+    // Prevent USB-Serial/JTAG (HWCDC) from blocking FreeRTOS tasks for 2000ms per print
+    // when plugged into a computer USB host port without an active serial monitor reading!
+    Serial.setTxTimeoutMs(0);
+#endif
     delay(500);
 
     Serial.println("\n==================================================");

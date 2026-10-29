@@ -284,8 +284,10 @@ void BotSportsAPIClient::handleStream() {
 
     // Read incoming SSE stream data in chunks (fast, non-blocking, zero per-byte ioctl overhead!)
     uint8_t buf[256];
-    while (_stream && _stream->available() > 0) {
-        int n = _stream->read(buf, sizeof(buf));
+    int avail = _stream ? _stream->available() : 0;
+    while (avail > 0) {
+        size_t toRead = (avail > (int)sizeof(buf)) ? sizeof(buf) : (size_t)avail;
+        int n = _stream->read(buf, toRead);
         if (n <= 0) break;
         _lastStreamDataReceived = millis();
         for (int i = 0; i < n; i++) {
@@ -324,6 +326,7 @@ void BotSportsAPIClient::handleStream() {
                 _streamLineBuffer += c;
             }
         }
+        avail = _stream ? _stream->available() : 0;
     }
 
     // Check for deferred status polling (structural changes), ONLY when the SSE stream is idle/drained
