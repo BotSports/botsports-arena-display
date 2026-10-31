@@ -17,9 +17,10 @@ public:
     void update();
 
     // Mode Selection
-    bool setMode(OperatingMode mode);
+    bool setMode(OperatingMode mode, bool persist = true);
     OperatingMode getMode() const { return _mode; }
     String getModeString() const;
+    bool saveCurrentAsDefaults();
 
     // Standalone Timer Controls
     void startTimer(bool withCountIn = false);
@@ -45,6 +46,7 @@ public:
 
     // Standalone Match Info
     void setMatchDetails(int matchNum, int roundNum, const String& redName, const String& blueName);
+    void setMatchStatus(const String& status);
     int getMatchNumber() const { return _matchNumber; }
     int getRoundNumber() const { return _roundNumber; }
     String getRedName() const { return _redName; }
@@ -64,6 +66,7 @@ public:
     // Bout Lifecycle & Decisions
     void finishMatch();
     void recordResult(const String& winnerCorner, const String& outcomeType); // winner: "red", "blue", "tied"; outcome: "ko", "decision", "forfeit"
+    void syncOutcome(const String& winnerCorner, const String& outcomeType, float outcomeTime);
     void clearResult();
     bool isFinished() const { return _matchStatus == "Finished"; }
     bool isDecided() const { return _matchStatus == "Decided"; }

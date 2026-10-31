@@ -88,8 +88,8 @@ void ArenaSyncManager::broadcastState(bool immediate) {
     if (!isMaster() || !_udpStarted) return;
 
     int activeSlaves = getSlaveCount();
-    unsigned long interval = (activeSlaves > 0) ? ARENA_SYNC_BROADCAST_MS : 3000;
-    if ((!immediate || activeSlaves == 0) && (millis() - _lastBroadcastMillis < interval)) {
+    unsigned long interval = (activeSlaves > 0) ? ARENA_SYNC_BROADCAST_MS : 500;
+    if (!immediate && (millis() - _lastBroadcastMillis < interval)) {
         return;
     }
     _lastBroadcastMillis = millis();
@@ -270,7 +270,7 @@ void ArenaSyncManager::_sendHeartbeatToMaster(IPAddress masterIP) {
 
 void ArenaSyncManager::_applySyncPacket(const ArenaSyncPacket& pkt) {
     // Slave mirrors match and clock state with exact synchronization
-    matchCtrl.setMode((OperatingMode)pkt.op_mode);
+    matchCtrl.setMode((OperatingMode)pkt.op_mode, false);
 
     // Update match info
     matchCtrl.setMatchDetails(pkt.match_number, pkt.round_number, String(pkt.red_name), String(pkt.blue_name));
@@ -282,12 +282,13 @@ void ArenaSyncManager::_applySyncPacket(const ArenaSyncPacket& pkt) {
     // Update Outcome & Decision state
     if (pkt.outcome_type > 0) {
         String winCorner = (pkt.winner_corner == 1) ? "red" : ((pkt.winner_corner == 2) ? "blue" : "tied");
-        String outType = (pkt.outcome_type == 1) ? "ko" : ((pkt.outcome_type == 2) ? "decision" : "forfeit");
-        matchCtrl.recordResult(winCorner, outType);
+        String outType = (pkt.outcome_type == 1) ? "ko" : ((pkt.outcome_type == 2) ? "decision" : ((pkt.outcome_type == 4) ? "tied" : "forfeit"));
+        matchCtrl.syncOutcome(winCorner, outType, pkt.outcome_time);
     } else if (pkt.match_status == 2) {
         matchCtrl.finishMatch();
     } else {
         matchCtrl.clearResult();
+        matchCtrl.setMatchStatus((pkt.match_status == 1) ? "Ongoing" : "Scheduled");
     }
 
     // Synchronize timer clock with master
@@ -296,7 +297,12 @@ void ArenaSyncManager::_applySyncPacket(const ArenaSyncPacket& pkt) {
     float currentRem = matchCtrl.getCurrentRemainingSeconds();
     ClockState currentClockState = matchCtrl.getClockState();
 
-    if (currentClockState != masterClockState || abs(masterRem - currentRem) > 0.15f || masterClockState == CLOCK_COUNT_IN) {
+    if (currentClockState != masterClockState ||
+        abs(masterRem - currentRem) > 0.15f ||
+        masterClockState == CLOCK_COUNT_IN ||
+        matchCtrl.getCurrentPauseReason() != String(pkt.pause_reason) ||
+        abs(matchCtrl.getDuration() - pkt.duration_seconds) > 0.5f ||
+        abs(matchCtrl.getHazardsThreshold() - pkt.hazards_seconds) > 0.5f) {
         matchCtrl.syncClock(masterClockState, masterRem, pkt.duration_seconds, pkt.count_in_seconds, pkt.hazards_seconds, pkt.is_hazards_active != 0, String(pkt.pause_reason));
     }
 

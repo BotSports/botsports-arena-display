@@ -67,6 +67,7 @@ private:
     void _handleControlReady();
     void _handleControlResult();
     void _handleControlMode();
+    void _handleControlSaveDefaults();
     void _handleControlTest();
     void _handleControlBrightness();
     void _handleOTAComplete();

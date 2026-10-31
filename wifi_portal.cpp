@@ -195,6 +195,7 @@ void WiFiPortal::_setupWebServer() {
     _server.on("/api/control/ready", HTTP_POST, [this]() { _handleControlReady(); });
     _server.on("/api/control/result", HTTP_POST, [this]() { _handleControlResult(); });
     _server.on("/api/control/mode", HTTP_POST, [this]() { _handleControlMode(); });
+    _server.on("/api/control/save_defaults", HTTP_POST, [this]() { _handleControlSaveDefaults(); });
     _server.on("/api/control/test", HTTP_POST, [this]() { _handleControlTest(); });
     _server.on("/api/control/brightness", HTTP_POST, [this]() { _handleControlBrightness(); });
 
@@ -240,6 +241,7 @@ void WiFiPortal::_handleScan() {
 void WiFiPortal::_handleSave() {
     String oldSSID = configMgr.settings.wifi_ssid;
     String oldPass = configMgr.settings.wifi_pass;
+    String oldApiKey = configMgr.settings.api_key;
 
     if (!_server.hasArg("plain")) {
         configMgr.settings.wifi_ssid = _server.arg("ssid");
@@ -296,7 +298,7 @@ void WiFiPortal::_handleSave() {
 
     displayMgr.setBrightness(configMgr.settings.brightness);
 
-    // Validate API key if configured
+    // Validate API key if configured (preserve user's chosen Operating Mode unless a new key was just added)
     bool keyValid = false;
     String validationNote = "";
     if (configMgr.settings.api_key.length() > 0) {
@@ -305,13 +307,13 @@ void WiFiPortal::_handleSave() {
             keyValid = apiClient.validateApiKey(configMgr.settings.api_key, configMgr.settings.api_url, err);
             if (keyValid) {
                 validationNote = "Key verified for " + apiClient.getArenaName() + "!";
-                matchCtrl.setMode(OPMODE_API);
-                configMgr.settings.op_mode = (uint8_t)OPMODE_API;
+                if (oldApiKey.length() == 0) {
+                    matchCtrl.setMode(OPMODE_API, true);
+                }
             } else {
                 validationNote = "Warning: Key validation failed (" + err + ").";
                 if (matchCtrl.getMode() == OPMODE_API) {
-                    matchCtrl.setMode(OPMODE_STANDALONE);
-                    configMgr.settings.op_mode = (uint8_t)OPMODE_STANDALONE;
+                    matchCtrl.setMode(OPMODE_STANDALONE, false);
                 }
             }
         } else {
@@ -320,8 +322,7 @@ void WiFiPortal::_handleSave() {
     } else {
         apiClient.setKeyValid(false);
         if (matchCtrl.getMode() == OPMODE_API) {
-            matchCtrl.setMode(OPMODE_STANDALONE);
-            configMgr.settings.op_mode = (uint8_t)OPMODE_STANDALONE;
+            matchCtrl.setMode(OPMODE_STANDALONE, true);
         }
     }
 
@@ -537,8 +538,47 @@ void WiFiPortal::_handleControlMatch() {
     String blue = doc["blue_name"] | matchCtrl.getBlueName();
 
     matchCtrl.setMatchDetails(mNum, rNum, red, blue);
+    if (!doc["hazards_seconds"].isNull()) {
+        matchCtrl.setHazardsThreshold(doc["hazards_seconds"].as<float>());
+    }
+    matchCtrl.saveCurrentAsDefaults();
     arenaSync.broadcastState(true);
     _handleControlStatus();
+}
+
+void WiFiPortal::_handleControlSaveDefaults() {
+    if (_server.hasArg("plain") && _server.arg("plain").length() > 0) {
+        JsonDocument doc;
+        if (!deserializeJson(doc, _server.arg("plain"))) {
+            String mode = doc["mode"] | "";
+            if (mode.equalsIgnoreCase("standalone")) {
+                matchCtrl.setMode(OPMODE_STANDALONE, true);
+                apiClient.disconnectStream();
+            } else if (mode.equalsIgnoreCase("api") && apiClient.isKeyValid()) {
+                matchCtrl.setMode(OPMODE_API, true);
+            }
+            int mNum = doc["match_number"] | matchCtrl.getMatchNumber();
+            int rNum = doc["round_number"] | matchCtrl.getRoundNumber();
+            String red = doc["red_name"] | matchCtrl.getRedName();
+            String blue = doc["blue_name"] | matchCtrl.getBlueName();
+            matchCtrl.setMatchDetails(mNum, rNum, red, blue);
+
+            if (!doc["hazards_seconds"].isNull()) {
+                matchCtrl.setHazardsThreshold(doc["hazards_seconds"].as<float>());
+            }
+            if (!doc["duration_seconds"].isNull()) {
+                matchCtrl.setDuration(doc["duration_seconds"].as<float>());
+            }
+        }
+    }
+
+    bool ok = matchCtrl.saveCurrentAsDefaults();
+    arenaSync.broadcastState(true);
+    if (ok) {
+        _server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Startup defaults (mode & local values) saved for future reboots!\"}");
+    } else {
+        _server.send(500, "application/json", "{\"status\":\"error\",\"message\":\"Failed to write defaults to NVS flash\"}");
+    }
 }
 
 void WiFiPortal::_handleControlMode() {
@@ -580,6 +620,7 @@ void WiFiPortal::_handleControlTest() {
     String testName = doc["test"] | "";
     matchCtrl.triggerScreenTest(testName);
 
+    arenaSync.broadcastState(true);
     _handleControlStatus();
 }
 
@@ -593,6 +634,7 @@ void WiFiPortal::_handleControlBrightness() {
 
     configMgr.settings.brightness = (uint8_t)val;
     displayMgr.setBrightness(configMgr.settings.brightness);
+    configMgr.saveSettings();
 
     _server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
@@ -1120,7 +1162,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
   <div class="status-bar">
     <div>
       <strong id="device_name" style="color:var(--text);">BotSports Display</strong>
-      <span id="fw_version_badge" style="margin-left:5px;font-size:11px;color:var(--dim);">v1.4.4</span>
+      <span id="fw_version_badge" style="margin-left:5px;font-size:11px;color:var(--dim);">v1.4.5</span>
       <span id="mdns_link" style="margin-left:6px;"><a href="http://botsports-arena.local" style="color:var(--gold);text-decoration:none;">.local</a></span>
     </div>
     <span class="pill" id="conn_pill">Connecting...</span>
@@ -1142,9 +1184,12 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
       <button type="button" class="mode-btn" id="mode_btn_api" onclick="setMode('api')">BotSports API Sync</button>
       <button type="button" class="mode-btn" id="mode_btn_standalone" onclick="setMode('standalone')">Standalone Arena</button>
     </div>
-    <div style="display:flex;gap:6px;margin-bottom:12px;font-size:11px;align-items:center;">
-      <span id="key_badge" class="pill ap" style="cursor:pointer;" onclick="switchTab('tab_settings')">Key: Checking...</span>
-      <span id="stream_badge" class="pill" style="display:none;">SSE: Off</span>
+    <div style="display:flex;justify-content:space-between;gap:6px;margin-bottom:12px;font-size:11px;align-items:center;">
+      <div style="display:flex;gap:6px;align-items:center;">
+        <span id="key_badge" class="pill ap" style="cursor:pointer;" onclick="switchTab('tab_settings')">Key: Checking...</span>
+        <span id="stream_badge" class="pill" style="display:none;">SSE: Off</span>
+      </div>
+      <button type="button" class="btn-gray" style="flex:none;width:auto;padding:5px 10px;font-size:11px;border-color:var(--gold);color:var(--gold);" onclick="saveStartupDefaults()">&#128190; Save Defaults for Reboot</button>
     </div>
 
     <!-- Match Banner -->
@@ -1281,7 +1326,10 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
         <label>Hazards Threshold (Seconds Remaining)</label>
         <input type="text" id="input_hazards_sec" value="60">
       </div>
-      <button type="button" class="btn-yellow" onclick="saveMatchDetails()">Update Match Info</button>
+      <div class="btn-row" style="margin-bottom:0;">
+        <button type="button" class="btn-yellow" onclick="saveMatchDetails()">Update Match Info</button>
+        <button type="button" class="btn-green" onclick="saveStartupDefaults()">&#128190; Save for Reboot</button>
+      </div>
     </div>
   </div>
 
@@ -1410,7 +1458,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
     <div class="card">
       <div class="card-title">
         <span>Firmware Update (OTA)</span>
-        <span id="ota_ver_label" style="font-size:11px;color:var(--dim);">v1.4.4</span>
+        <span id="ota_ver_label" style="font-size:11px;color:var(--dim);">v1.4.5</span>
       </div>
 
       <!-- Automatic Online GitHub Release Updater -->
@@ -1446,6 +1494,7 @@ static const char PAGE_HTML[] PROGMEM = R"rawhtml(
 
 <script>
 let currentTab = 'tab_control';
+let initialControlLoaded = false;
 
 function switchTab(tabId) {
   document.getElementById('tab_control').style.display = (tabId === 'tab_control') ? 'block' : 'none';
@@ -1597,6 +1646,17 @@ function pollControlStatus() {
       const hInput = document.getElementById('input_hazards_sec');
       if (hInput && document.activeElement !== hInput) hInput.value = data.hazards_seconds;
     }
+    if (!initialControlLoaded) {
+      initialControlLoaded = true;
+      const mInput = document.getElementById('input_match_num');
+      const rInput = document.getElementById('input_round_num');
+      const redInput = document.getElementById('input_red_name');
+      const blueInput = document.getElementById('input_blue_name');
+      if (mInput && data.match_number) mInput.value = data.match_number;
+      if (rInput && data.round_number) rInput.value = data.round_number;
+      if (redInput && data.red_name) redInput.value = data.red_name;
+      if (blueInput && data.blue_name) blueInput.value = data.blue_name;
+    }
 
     if (data.clock_state === 'count_in') {
       const cSec = data.count_in_seconds;
@@ -1703,25 +1763,43 @@ function setMode(mode) {
 }
 
 function saveMatchDetails() {
+  const hSec = parseFloat(document.getElementById('input_hazards_sec').value) || 60;
   const payload = {
-    match_number: parseInt(document.getElementById('input_match_num').value),
-    round_number: parseInt(document.getElementById('input_round_num').value),
+    match_number: parseInt(document.getElementById('input_match_num').value) || 1,
+    round_number: parseInt(document.getElementById('input_round_num').value) || 1,
     red_name: document.getElementById('input_red_name').value,
-    blue_name: document.getElementById('input_blue_name').value
+    blue_name: document.getElementById('input_blue_name').value,
+    hazards_seconds: hSec
   };
   fetch('/api/control/match', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   }).then(r => r.json()).then(() => {
-    const hSec = parseFloat(document.getElementById('input_hazards_sec').value) || 60;
-    fetch('/api/control/timer', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'set_hazards', hazards_seconds: hSec })
-    });
-    showToast('Match details updated!', false);
+    showToast('Match details updated & saved!', false);
     pollControlStatus();
+  });
+}
+
+function saveStartupDefaults() {
+  const hSec = parseFloat(document.getElementById('input_hazards_sec').value) || 60;
+  const payload = {
+    match_number: parseInt(document.getElementById('input_match_num').value) || 1,
+    round_number: parseInt(document.getElementById('input_round_num').value) || 1,
+    red_name: document.getElementById('input_red_name').value,
+    blue_name: document.getElementById('input_blue_name').value,
+    hazards_seconds: hSec
+  };
+  fetch('/api/control/save_defaults', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }).then(async r => {
+    const data = await r.json();
+    showToast(data.message || 'Saved startup defaults for reboot!', !r.ok);
+    pollControlStatus();
+  }).catch(() => {
+    showToast('Failed to save startup defaults', true);
   });
 }
 

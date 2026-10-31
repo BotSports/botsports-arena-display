@@ -644,7 +644,7 @@ void DisplayManager::_renderKO() {
 void DisplayManager::_renderCountIn() {
     _dmaDisplay->fillScreen(_colorBlack);
 
-    int countSec = (matchCtrl.getMode() == OPMODE_STANDALONE) ? matchCtrl.getCurrentCountInSeconds() : apiClient.getInterpolatedCountInSeconds();
+    int countSec = matchCtrl.getCurrentCountInSeconds();
 
     // Top Header: pulsing yellow countdown banner
     _dmaDisplay->fillRect(0, 0, PANEL_RES_X, 8, _flashState ? _colorYellow : _dmaDisplay->color565(120, 100, 0));

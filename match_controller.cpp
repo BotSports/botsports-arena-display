@@ -2,6 +2,7 @@
 #include "config_manager.h"
 #include "display_manager.h"
 #include "api_client.h"
+#include "arena_sync.h"
 
 MatchController matchCtrl;
 
@@ -51,8 +52,15 @@ void MatchController::unlock() const {
 void MatchController::begin() {
     if (!_mutex) _mutex = xSemaphoreCreateRecursiveMutex();
     _mode = (OperatingMode)configMgr.settings.op_mode;
-    _hazardsThresholdSec = configMgr.settings.hazards_seconds;
-    if (_mode == OPMODE_API && configMgr.settings.api_key.length() == 0) {
+    _durationSec = (configMgr.settings.duration_seconds >= 5.0f) ? configMgr.settings.duration_seconds : 180.0f;
+    _remainingSec = _durationSec;
+    _hazardsThresholdSec = (configMgr.settings.hazards_seconds >= 0.0f) ? configMgr.settings.hazards_seconds : DEFAULT_HAZARDS_SECONDS;
+    _matchNumber = (configMgr.settings.default_match_num > 0) ? configMgr.settings.default_match_num : 1;
+    _roundNumber = (configMgr.settings.default_round_num > 0) ? configMgr.settings.default_round_num : 1;
+    if (configMgr.settings.default_red_name.length() > 0) _redName = configMgr.settings.default_red_name;
+    if (configMgr.settings.default_blue_name.length() > 0) _blueName = configMgr.settings.default_blue_name;
+
+    if (_mode == OPMODE_API && configMgr.settings.api_key.length() == 0 && !arenaSync.isSlave()) {
         _mode = OPMODE_STANDALONE;
         configMgr.settings.op_mode = (uint8_t)OPMODE_STANDALONE;
         configMgr.saveSettings();
@@ -63,32 +71,57 @@ void MatchController::begin() {
     Serial.printf("[MatchCtrl] Starting in %s Mode (restored from NVS).\n", (_mode == OPMODE_API) ? "BotSports API Sync" : "Standalone Arena");
 }
 
-bool MatchController::setMode(OperatingMode mode) {
+bool MatchController::setMode(OperatingMode mode, bool persist) {
     if (mode == OPMODE_API) {
-        if (!apiClient.isKeyValid()) {
+        if (!apiClient.isKeyValid() && !arenaSync.isSlave()) {
             Serial.println("[MatchCtrl] REJECTED switch to BotSports API Mode: No verified valid API key!");
             return false;
         }
+        bool changed = (_mode != OPMODE_API);
         _mode = OPMODE_API;
         _activeTestName = "";
-        clearResult();
-        configMgr.settings.op_mode = (uint8_t)OPMODE_API;
-        configMgr.saveSettings();
-        Serial.println("[MatchCtrl] Switched to BotSports API Mode (saved to NVS)");
+        if (changed) {
+            clearResult();
+            Serial.println("[MatchCtrl] Switched to BotSports API Mode");
+        }
+        if (persist && configMgr.settings.op_mode != (uint8_t)OPMODE_API) {
+            configMgr.settings.op_mode = (uint8_t)OPMODE_API;
+            configMgr.saveSettings();
+        }
         return true;
     } else if (mode == OPMODE_STANDALONE) {
+        bool changed = (_mode != OPMODE_STANDALONE);
         _mode = OPMODE_STANDALONE;
         _activeTestName = "";
-        configMgr.settings.op_mode = (uint8_t)OPMODE_STANDALONE;
-        configMgr.saveSettings();
-        Serial.println("[MatchCtrl] Switched to Standalone Arena Mode (saved to NVS)");
+        if (changed) {
+            Serial.println("[MatchCtrl] Switched to Standalone Arena Mode");
+        }
+        if (persist && configMgr.settings.op_mode != (uint8_t)OPMODE_STANDALONE) {
+            configMgr.settings.op_mode = (uint8_t)OPMODE_STANDALONE;
+            configMgr.saveSettings();
+        }
         return true;
     } else if (mode == OPMODE_TEST) {
-        _mode = OPMODE_TEST;
-        Serial.println("[MatchCtrl] Switched to Screen Test Mode");
+        if (_mode != OPMODE_TEST) {
+            _mode = OPMODE_TEST;
+            Serial.println("[MatchCtrl] Switched to Screen Test Mode");
+        }
         return true;
     }
     return false;
+}
+
+bool MatchController::saveCurrentAsDefaults() {
+    if (_mode == OPMODE_API || _mode == OPMODE_STANDALONE) {
+        configMgr.settings.op_mode = (uint8_t)_mode;
+    }
+    configMgr.settings.duration_seconds = _durationSec;
+    configMgr.settings.hazards_seconds = _hazardsThresholdSec;
+    configMgr.settings.default_match_num = _matchNumber;
+    configMgr.settings.default_round_num = _roundNumber;
+    configMgr.settings.default_red_name = _redName;
+    configMgr.settings.default_blue_name = _blueName;
+    return configMgr.saveSettings();
 }
 
 String MatchController::getModeString() const {
@@ -159,14 +192,20 @@ void MatchController::setDuration(float seconds) {
     if (_clockState == CLOCK_STOPPED || _clockState == CLOCK_EXPIRED) {
         _remainingSec = _durationSec;
     }
+    if (!arenaSync.isSlave()) {
+        configMgr.settings.duration_seconds = _durationSec;
+        configMgr.saveSettings();
+    }
     Serial.printf("[MatchCtrl] Match duration set to %.0f seconds\n", _durationSec);
 }
 
 void MatchController::setHazardsThreshold(float seconds) {
     if (seconds < 0.0f) seconds = 0.0f;
     _hazardsThresholdSec = seconds;
-    configMgr.settings.hazards_seconds = seconds;
-    configMgr.saveSettings();
+    if (!arenaSync.isSlave()) {
+        configMgr.settings.hazards_seconds = seconds;
+        configMgr.saveSettings();
+    }
     Serial.printf("[MatchCtrl] Hazards threshold set to %.0f seconds\n", _hazardsThresholdSec);
 }
 
@@ -188,45 +227,70 @@ float MatchController::getRemainingSeconds() const {
 
 void MatchController::syncClock(ClockState state, float remainingSec, float durationSec, int countInSec, float hazardsSec, bool hazardsActive, const String& pauseReason) {
     if (durationSec >= 5.0f) _durationSec = durationSec;
+    if (state == CLOCK_COUNT_IN) {
+        int clampedCount = (countInSec >= 0 && countInSec <= 3) ? countInSec : 3;
+        if (_clockState != CLOCK_COUNT_IN || _countInSeconds != clampedCount) {
+            _countInSeconds = clampedCount;
+            int step = 3 - clampedCount; // 0s for '3', 1s for '2', 2s for '1', 3s for '0' ("FIGHT!")
+            _countInStartMillis = millis() - (unsigned long)(step * 1000);
+        }
+    } else {
+        _countInSeconds = -1;
+    }
     _clockState = state;
     _remainingSec = remainingSec;
-    _countInSeconds = countInSec;
     if (hazardsSec > 0.0f) _hazardsThresholdSec = hazardsSec;
     _pauseReason = pauseReason;
     _lastClockUpdateMillis = millis();
 }
 
 void MatchController::setMatchDetails(int matchNum, int roundNum, const String& redName, const String& blueName) {
-    if (matchNum > 0) _matchNumber = matchNum;
-    if (roundNum > 0) _roundNumber = roundNum;
-    if (redName.length() > 0) _redName = redName;
-    if (blueName.length() > 0) _blueName = blueName;
-    Serial.printf("[MatchCtrl] Match details updated: M%d R%d, Red: %s, Blue: %s\n",
-                  _matchNumber, _roundNumber, _redName.c_str(), _blueName.c_str());
+    bool changed = false;
+    if (matchNum > 0 && _matchNumber != matchNum) { _matchNumber = matchNum; changed = true; }
+    if (roundNum > 0 && _roundNumber != roundNum) { _roundNumber = roundNum; changed = true; }
+    if (redName.length() > 0 && _redName != redName) { _redName = redName; changed = true; }
+    if (blueName.length() > 0 && _blueName != blueName) { _blueName = blueName; changed = true; }
+    if (changed) {
+        Serial.printf("[MatchCtrl] Match details updated: M%d R%d, Red: %s, Blue: %s\n",
+                      _matchNumber, _roundNumber, _redName.c_str(), _blueName.c_str());
+    }
+}
+
+void MatchController::setMatchStatus(const String& status) {
+    if (_matchStatus != status) {
+        _matchStatus = status;
+    }
 }
 
 void MatchController::setRedReadiness(bool pit, bool gate, bool match) {
-    _redPitReady = pit;
-    _redCheckedIn = gate;
-    _redMatchReady = match;
-    Serial.printf("[MatchCtrl] Red Readiness: Pit=%d, Gate=%d, Match=%d\n", pit, gate, match);
+    if (_redPitReady != pit || _redCheckedIn != gate || _redMatchReady != match) {
+        _redPitReady = pit;
+        _redCheckedIn = gate;
+        _redMatchReady = match;
+        Serial.printf("[MatchCtrl] Red Readiness: Pit=%d, Gate=%d, Match=%d\n", pit, gate, match);
+    }
 }
 
 void MatchController::setBlueReadiness(bool pit, bool gate, bool match) {
-    _bluePitReady = pit;
-    _blueCheckedIn = gate;
-    _blueMatchReady = match;
-    Serial.printf("[MatchCtrl] Blue Readiness: Pit=%d, Gate=%d, Match=%d\n", pit, gate, match);
+    if (_bluePitReady != pit || _blueCheckedIn != gate || _blueMatchReady != match) {
+        _bluePitReady = pit;
+        _blueCheckedIn = gate;
+        _blueMatchReady = match;
+        Serial.printf("[MatchCtrl] Blue Readiness: Pit=%d, Gate=%d, Match=%d\n", pit, gate, match);
+    }
 }
 
 void MatchController::finishMatch() {
     if (_clockState == CLOCK_RUNNING) {
         pauseTimer();
     }
+    bool wasFinished = (_matchStatus == "Finished" && _clockState == CLOCK_STOPPED);
     _clockState = CLOCK_STOPPED;
     _matchStatus = "Finished";
     displayMgr.setScreen(SCREEN_FINISHED);
-    Serial.printf("[MatchCtrl] Match marked as Finished (Scoring in progress) at %.1fs remaining\n", _remainingSec);
+    if (!wasFinished) {
+        Serial.printf("[MatchCtrl] Match marked as Finished (Scoring in progress) at %.1fs remaining\n", _remainingSec);
+    }
 }
 
 void MatchController::recordResult(const String& winnerCorner, const String& outcomeType) {
@@ -260,6 +324,34 @@ void MatchController::recordResult(const String& winnerCorner, const String& out
 
     Serial.printf("[MatchCtrl] Bout Outcome Decided! Winner: %s (%s Corner) via %s at %.1fs\n",
                   _winnerName.c_str(), _winnerCorner.c_str(), _outcomeType.c_str(), _outcomeTimeRemaining);
+}
+
+void MatchController::syncOutcome(const String& winnerCorner, const String& outcomeType, float outcomeTime) {
+    String normOutcome = outcomeType;
+    normOutcome.toLowerCase();
+    String normCorner = winnerCorner;
+    normCorner.toLowerCase();
+    if (normCorner != "red" && normCorner != "blue") {
+        normCorner = "tied";
+    }
+
+    bool isNewOutcome = (_matchStatus != "Decided" || _outcomeType != normOutcome || _winnerCorner != normCorner);
+    _matchStatus = "Decided";
+    _outcomeType = normOutcome;
+    _winnerCorner = normCorner;
+
+    if (_winnerCorner == "red") {
+        _winnerName = getCurrentRedName();
+    } else if (_winnerCorner == "blue") {
+        _winnerName = getCurrentBlueName();
+    } else {
+        _winnerName = "Draw / Tied";
+    }
+
+    _outcomeTimeRemaining = outcomeTime;
+    if (isNewOutcome) {
+        _outcomeStartMillis = millis();
+    }
 }
 
 void MatchController::triggerKO(const String& winnerCorner) {
@@ -340,9 +432,10 @@ void MatchController::triggerScreenTest(const String& testName) {
 }
 
 void MatchController::update() {
-    if (_mode == OPMODE_STANDALONE) {
+    if (_mode == OPMODE_STANDALONE || _mode == OPMODE_TEST) {
         if (_clockState == CLOCK_COUNT_IN) {
             unsigned long elapsed = millis() - _countInStartMillis;
+            int prevCountIn = _countInSeconds;
             if (elapsed < 1000) {
                 _countInSeconds = 3;
             } else if (elapsed < 2000) {
@@ -351,14 +444,21 @@ void MatchController::update() {
                 _countInSeconds = 1;
             } else if (elapsed < 4000) {
                 _countInSeconds = 0; // "FIGHT!"
-            } else {
-                _clockState = CLOCK_RUNNING;
+            } else if (!arenaSync.isSlave() || elapsed >= 4250) {
+                _clockState = (_mode == OPMODE_TEST) ? CLOCK_STOPPED : CLOCK_RUNNING;
                 _countInSeconds = -1;
                 _lastClockUpdateMillis = millis();
                 displayMgr.setScreen(SCREEN_ACTIVE_MATCH);
                 Serial.println("[MatchCtrl] Count-in completed! FIGHT clock running!");
+                if (arenaSync.isMaster()) {
+                    arenaSync.broadcastState(true);
+                }
+                return;
             }
-        } else if (_clockState == CLOCK_RUNNING) {
+            if (_countInSeconds != prevCountIn && arenaSync.isMaster()) {
+                arenaSync.broadcastState(true);
+            }
+        } else if (_clockState == CLOCK_RUNNING && _mode == OPMODE_STANDALONE) {
             float elapsed = (millis() - _lastClockUpdateMillis) / 1000.0f;
             if (elapsed >= 0.05f) { // Update every 50ms
                 _remainingSec -= elapsed;
@@ -369,6 +469,9 @@ void MatchController::update() {
                     _clockState = CLOCK_EXPIRED;
                     finishMatch();
                     Serial.println("[MatchCtrl] Standalone match clock expired! TIME!");
+                    if (arenaSync.isMaster()) {
+                        arenaSync.broadcastState(true);
+                    }
                 }
             }
         }

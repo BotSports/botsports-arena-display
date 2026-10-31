@@ -23,6 +23,13 @@ struct AppSettings {
     // Tournament Scoping & Hazard Configuration
     int tournament_id;   // 0 = auto-resolve, >0 = scoped to specific tournament
     float hazards_seconds; // countdown mark for hazards activation (default 60s)
+
+    // Persisted Standalone Match Defaults
+    float duration_seconds;
+    String default_red_name;
+    String default_blue_name;
+    int default_match_num;
+    int default_round_num;
 };
 
 

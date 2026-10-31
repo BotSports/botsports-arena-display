@@ -15,10 +15,19 @@ ConfigManager::ConfigManager() {
     settings.op_mode = 1; // Default to Standalone (0=API, 1=Standalone)
     settings.tournament_id = 0;
     settings.hazards_seconds = DEFAULT_HAZARDS_SECONDS;
+    settings.duration_seconds = 180.0f;
+    settings.default_red_name = "Tombstone";
+    settings.default_blue_name = "Minotaur";
+    settings.default_match_num = 1;
+    settings.default_round_num = 1;
 }
 
 bool ConfigManager::begin() {
-    return _prefs.begin("botsports", false);
+    bool ok = _prefs.begin("botsports", false);
+    if (ok) {
+        _prefs.end();
+    }
+    return ok;
 }
 
 void ConfigManager::loadSettings() {
@@ -35,6 +44,11 @@ void ConfigManager::loadSettings() {
     settings.op_mode = _prefs.getUChar("op_mode", 1);
     settings.tournament_id = _prefs.getInt("tourn_id", 0);
     settings.hazards_seconds = _prefs.getFloat("hazards_sec", DEFAULT_HAZARDS_SECONDS);
+    settings.duration_seconds = _prefs.getFloat("dur_sec", 180.0f);
+    settings.default_red_name = _prefs.getString("red_name", "Tombstone");
+    settings.default_blue_name = _prefs.getString("blue_name", "Minotaur");
+    settings.default_match_num = _prefs.getInt("match_num", 1);
+    settings.default_round_num = _prefs.getInt("round_num", 1);
     _prefs.end();
 
     if (settings.brightness == 0) {
@@ -42,6 +56,21 @@ void ConfigManager::loadSettings() {
     }
     if (settings.hazards_seconds <= 0.0f) {
         settings.hazards_seconds = DEFAULT_HAZARDS_SECONDS;
+    }
+    if (settings.duration_seconds < 5.0f) {
+        settings.duration_seconds = 180.0f;
+    }
+    if (settings.default_red_name.length() == 0) {
+        settings.default_red_name = "Tombstone";
+    }
+    if (settings.default_blue_name.length() == 0) {
+        settings.default_blue_name = "Minotaur";
+    }
+    if (settings.default_match_num <= 0) {
+        settings.default_match_num = 1;
+    }
+    if (settings.default_round_num <= 0) {
+        settings.default_round_num = 1;
     }
 
     if (settings.api_url.length() == 0) {
@@ -57,8 +86,13 @@ void ConfigManager::loadSettings() {
     Serial.printf("  API Key: %s\n", settings.api_key.length() > 6 ? (settings.api_key.substring(0, 6) + "...").c_str() : "(empty)");
     Serial.printf("  Corner: %s\n", settings.corner.c_str());
     Serial.printf("  Brightness: %u\n", settings.brightness);
+    Serial.printf("  Op Mode: %s\n", (settings.op_mode == 0) ? "BotSports API Sync" : "Standalone Arena");
     Serial.printf("  Sync Role: %s\n", (settings.sync_role == SYNC_ROLE_MASTER) ? "Master" : ((settings.sync_role == SYNC_ROLE_SLAVE) ? "Slave" : "Solo"));
     Serial.printf("  Sync Key: %s\n", settings.sync_key.c_str());
+    Serial.printf("  Local Defaults: R%d M%d | %s vs %s | Dur=%.0fs | Haz=%.0fs\n",
+                  settings.default_round_num, settings.default_match_num,
+                  settings.default_red_name.c_str(), settings.default_blue_name.c_str(),
+                  settings.duration_seconds, settings.hazards_seconds);
 }
 
 bool ConfigManager::saveSettings() {
@@ -79,6 +113,11 @@ bool ConfigManager::saveSettings() {
     _prefs.putUChar("op_mode", settings.op_mode);
     _prefs.putInt("tourn_id", settings.tournament_id);
     _prefs.putFloat("hazards_sec", settings.hazards_seconds);
+    _prefs.putFloat("dur_sec", settings.duration_seconds);
+    _prefs.putString("red_name", settings.default_red_name);
+    _prefs.putString("blue_name", settings.default_blue_name);
+    _prefs.putInt("match_num", settings.default_match_num);
+    _prefs.putInt("round_num", settings.default_round_num);
     settings.is_configured = true;
     _prefs.end();
 
@@ -103,6 +142,11 @@ void ConfigManager::resetToDefaults() {
     settings.op_mode = 1;
     settings.tournament_id = 0;
     settings.hazards_seconds = DEFAULT_HAZARDS_SECONDS;
+    settings.duration_seconds = 180.0f;
+    settings.default_red_name = "Tombstone";
+    settings.default_blue_name = "Minotaur";
+    settings.default_match_num = 1;
+    settings.default_round_num = 1;
 
     Serial.println("[Config] All settings reset to factory defaults");
 }

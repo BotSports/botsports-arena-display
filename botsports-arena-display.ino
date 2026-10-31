@@ -47,7 +47,7 @@ void apiTask(void *param) {
             } else {
                 // Key is invalid - cannot run API mode!
                 Serial.println("[Tasks] API Key not valid! Reverting to Standalone Arena Mode.");
-                matchCtrl.setMode(OPMODE_STANDALONE);
+                matchCtrl.setMode(OPMODE_STANDALONE, false);
                 apiClient.disconnectStream();
             }
         } else {
@@ -103,16 +103,17 @@ void setup() {
         displayMgr.showConnecting(configMgr.settings.wifi_ssid, 100);
         delay(300);
 
-        // In API mode, validate API key before starting
-        if (matchCtrl.getMode() == OPMODE_API && !arenaSync.isSlave()) {
+        // Validate API key on boot if configured (so key status badge is ready),
+        // while preserving the user's persisted Operating Mode (API vs Standalone).
+        if (configMgr.settings.api_key.length() > 0 && !arenaSync.isSlave()) {
             Serial.println("[System] Master validating API key against BotSports API...");
             String err;
             if (apiClient.validateApiKey(configMgr.settings.api_key, configMgr.settings.api_url, err)) {
                 Serial.printf("[System] BotSports API key verified for arena: '%s'\n", apiClient.getData().arena_name.c_str());
                 arenaSync.broadcastState(true);
-            } else {
+            } else if (matchCtrl.getMode() == OPMODE_API) {
                 Serial.printf("[System] BotSports API key invalid (%s). Switching to Standalone Mode.\n", err.c_str());
-                matchCtrl.setMode(OPMODE_STANDALONE);
+                matchCtrl.setMode(OPMODE_STANDALONE, false);
             }
         }
     }
